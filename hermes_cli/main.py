@@ -252,28 +252,23 @@ def cmd_tools_help(args: argparse.Namespace) -> int:
 def cmd_tools_list(args: argparse.Namespace) -> int:
     registry = _load_tool_registry()
     if registry is None:
-        print("no tool registry available — Phase 2.1.4 will provide tools/registry.py")
+        print("no tool registry loaded (tools/registry.py missing)")
         return 0
-    list_tools = getattr(registry, "list_tools", None) or getattr(registry, "list_schemas", None)
-    if not callable(list_tools):
-        print("tools.registry has neither list_tools() nor list_schemas()")
-        return 1
-    items = list_tools() or []
-    if not items:
+    names = registry.get_all_tool_names()
+    if not names:
         print("(no tools registered)")
         return 0
-    for item in items:
-        if isinstance(item, dict):
-            fn = item.get("function") or {}
-            name = item.get("name") or fn.get("name") or "<unnamed>"
-            desc = item.get("description") or fn.get("description") or ""
-            print(f"  {name:24s} {desc}")
-            if args.verbose:
-                params = fn.get("parameters")
-                if params:
-                    print("      schema:", json.dumps(params, ensure_ascii=False))
-        else:
-            print(f"  {item}")
+    for name in names:
+        toolset = registry.get_toolset_for_tool(name) or "?"
+        schema = registry.get_schema(name) or {}
+        desc = schema.get("description", "")
+        # Trim long descriptions to one line for the default view.
+        first_line = desc.splitlines()[0] if desc else ""
+        print(f"  {name:24s} [{toolset}]  {first_line}")
+        if args.verbose:
+            params = schema.get("parameters")
+            if params:
+                print("      schema:", json.dumps(params, ensure_ascii=False))
     return 0
 
 
@@ -402,9 +397,15 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 def _load_tool_registry():
-    """Import tools.registry if present.  Phase 2.1.4 ships the real one."""
+    """Return the singleton ``tools.registry.registry``, or None.
+
+    Importing ``tools`` runs its ``__init__.py``, which triggers each
+    built-in tool module's top-level ``registry.register(...)`` call.
+    By the time we hand back the singleton, all built-ins are loaded.
+    """
     try:
-        from tools import registry  # type: ignore[import-not-found]
+        from tools.registry import registry  # type: ignore[import-not-found]
+        import tools  # type: ignore[import-not-found]  # noqa: F401
         return registry
     except ImportError:
         return None

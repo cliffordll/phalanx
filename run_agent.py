@@ -158,9 +158,16 @@ class IterationBudget:
 # returns None and the agent runs in tool-less mode (still a valid loop).
 
 def _load_tool_registry():
-    """Return the tools.registry module if available, else None."""
+    """Return the singleton ``tools.registry.registry``, or None.
+
+    Importing ``tools.registry`` runs ``tools/__init__.py`` first, which
+    triggers each built-in tool module's top-level ``registry.register(...)``
+    call.  By the time we return, all built-in tools are already registered.
+    """
     try:
-        from tools import registry  # type: ignore[import-not-found]
+        from tools.registry import registry  # type: ignore[import-not-found]
+        # Force tools package init so self-registering modules load.
+        import tools  # type: ignore[import-not-found]  # noqa: F401
         return registry
     except ImportError:
         return None
@@ -324,9 +331,12 @@ class AIAgent:
     def _resolve_tool_schemas(self) -> List[Dict[str, Any]]:
         """Return the OpenAI-format tool schemas this agent should expose.
 
-        Reads ``tools.registry.list_schemas()`` if available (Phase 2.1.4+);
-        otherwise returns ``[]`` (tool-less mode).  Filters by
-        ``enabled_toolsets`` / ``disabled_toolsets`` when set.
+        Uses upstream's ``get_all_tool_names()`` + ``get_definitions()``
+        pair — ``get_definitions`` already filters out tools whose
+        ``check_fn()`` reports unavailable, and emits the
+        ``{"type": "function", "function": {...}}`` envelope the SDK
+        expects.  Falls back to ``[]`` (tool-less mode) when the
+        registry isn't loaded.
         """
         if self._tool_schemas_cache is not None:
             return self._tool_schemas_cache
@@ -336,41 +346,35 @@ class AIAgent:
             self._tool_schemas_cache = []
             return self._tool_schemas_cache
 
-        list_schemas = getattr(registry, "list_schemas", None)
-        if not callable(list_schemas):
+        try:
+            all_names = registry.get_all_tool_names()
+        except Exception as exc:
+            logger.warning("registry.get_all_tool_names() failed: %s", exc)
             self._tool_schemas_cache = []
             return self._tool_schemas_cache
+
+        # toolset filtering: drop tools whose toolset is disabled or not enabled.
+        if self.enabled_toolsets or self.disabled_toolsets:
+            enabled_lower = {t.lower() for t in self.enabled_toolsets}
+            disabled_lower = {t.lower() for t in self.disabled_toolsets}
+            kept = []
+            for name in all_names:
+                toolset = (registry.get_toolset_for_tool(name) or "").lower()
+                if disabled_lower and toolset in disabled_lower:
+                    continue
+                if enabled_lower and toolset not in enabled_lower:
+                    continue
+                kept.append(name)
+            all_names = kept
 
         try:
-            schemas = list_schemas() or []
+            schemas = registry.get_definitions(set(all_names), quiet=self.quiet_mode)
         except Exception as exc:
-            logger.warning("tools.registry.list_schemas() failed: %s", exc)
-            self._tool_schemas_cache = []
-            return self._tool_schemas_cache
+            logger.warning("registry.get_definitions() failed: %s", exc)
+            schemas = []
 
-        # toolset filtering — best-effort, not all registries expose it.
-        if self.enabled_toolsets or self.disabled_toolsets:
-            filtered = []
-            for schema in schemas:
-                toolset = (schema.get("toolset") or "").lower()
-                if self.disabled_toolsets and toolset in (t.lower() for t in self.disabled_toolsets):
-                    continue
-                if self.enabled_toolsets and toolset not in (t.lower() for t in self.enabled_toolsets):
-                    continue
-                filtered.append(schema)
-            schemas = filtered
-
-        # Strip phalanx-specific keys before passing to the OpenAI SDK.
-        # The SDK rejects unknown top-level keys on each tool entry.
-        normalized = []
-        for schema in schemas:
-            entry = {k: v for k, v in schema.items() if k in ("type", "function")}
-            if "function" in entry and "type" not in entry:
-                entry["type"] = "function"
-            normalized.append(entry)
-
-        self._tool_schemas_cache = normalized
-        return normalized
+        self._tool_schemas_cache = schemas
+        return schemas
 
     def _dispatch_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
         """Run a single tool by name, returning a string result."""
