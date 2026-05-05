@@ -279,6 +279,149 @@ def _accumulate_stream(stream, callback: Callable[[str], None]) -> Any:
     )
 
 
+# ── Anthropic response normalization ────────────────────────────────────
+# Wave 3 light path: take whatever ``Anthropic.messages.create`` returned
+# and dress it up as an OpenAI ChatCompletion so the rest of the agent
+# loop is provider-agnostic.  Mirrors ``agent/transports/anthropic.py``'s
+# ``normalize_response`` upstream, but flattened — phalanx has no
+# transport ABC / NormalizedResponse dataclass yet, so we emit the same
+# SimpleNamespace shape that ``_accumulate_stream`` produces.
+
+# Anthropic stop_reason → OpenAI finish_reason mapping (kept in sync with
+# upstream agent/transports/anthropic.py:_STOP_REASON_MAP).
+_ANTHROPIC_STOP_TO_OPENAI = {
+    "end_turn": "stop",
+    "tool_use": "tool_calls",
+    "max_tokens": "length",
+    "stop_sequence": "stop",
+    "refusal": "content_filter",
+    "model_context_window_exceeded": "length",
+}
+
+
+def _accumulate_anthropic_stream(
+    stream_ctx: Any,
+    callback: Callable[[str], None],
+) -> Any:
+    """Drain an Anthropic Messages stream, firing ``callback`` per text delta.
+
+    ``stream_ctx`` is the value returned from ``client.messages.stream(**kw)``
+    — a context manager that yields ``content_block_*`` / ``message_*``
+    events from ``__iter__``.  We forward ``text_delta`` events to the
+    live callback so a TTY consumer sees tokens as they arrive; everything
+    else (tool_use input_json_delta, thinking_delta) is left to the SDK's
+    ``stream.get_final_message()`` which assembles the canonical Message
+    object.
+
+    Returns the same ``SimpleNamespace`` shape as the non-streaming path so
+    the run loop in ``run_conversation`` doesn't need to branch on whether
+    streaming was used.
+    """
+    with stream_ctx as stream:
+        for event in stream:
+            if getattr(event, "type", None) != "content_block_delta":
+                continue
+            delta = getattr(event, "delta", None)
+            if delta is None:
+                continue
+            if getattr(delta, "type", None) != "text_delta":
+                continue
+            text = getattr(delta, "text", "")
+            if not text:
+                continue
+            try:
+                callback(text)
+            except Exception:
+                logger.exception("anthropic stream callback failed; continuing accumulation")
+        final = stream.get_final_message()
+    return _anthropic_response_to_openai_shape(final)
+
+
+def _anthropic_response_to_openai_shape(response: Any) -> Any:
+    """Wrap an Anthropic Messages response in the OpenAI ChatCompletion shape.
+
+    The run loop reads only:
+      response.choices[0].message.content       (str | None)
+      response.choices[0].message.tool_calls    (list | None)
+      response.choices[0].finish_reason         (str | None)
+
+    plus ``_serialize_tool_calls`` walks each tool_call's ``id`` /
+    ``function.name`` / ``function.arguments``.  This converter populates
+    exactly those fields and nothing else; reasoning blocks are dropped on
+    the floor for now (they show up if/when the assistant_message builder
+    in §2.4 wave 4 lands — see docs/MIGRATION_PLAN.md §2.4).
+    """
+    text_parts: list[str] = []
+    tool_calls: list[Any] = []
+
+    for block in getattr(response, "content", None) or []:
+        block_type = getattr(block, "type", None)
+        if block_type == "text":
+            text_parts.append(getattr(block, "text", "") or "")
+        elif block_type == "tool_use":
+            args = getattr(block, "input", None)
+            tool_calls.append(SimpleNamespace(
+                id=getattr(block, "id", None),
+                type="function",
+                function=SimpleNamespace(
+                    name=getattr(block, "name", "") or "",
+                    arguments=json.dumps(args if args is not None else {}),
+                ),
+            ))
+        # thinking / redacted_thinking blocks are intentionally ignored
+        # here — wave 4 will pick them up via _build_assistant_message.
+
+    raw_stop = getattr(response, "stop_reason", None)
+    finish_reason = _ANTHROPIC_STOP_TO_OPENAI.get(raw_stop, "stop")
+
+    message = SimpleNamespace(
+        role="assistant",
+        content="".join(text_parts) or None,
+        tool_calls=tool_calls or None,
+    )
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+    )
+
+
+# ── Provider detection ──────────────────────────────────────────────────
+# Inspect the base_url to guess which adapter should handle a turn.
+# Phase 2.4 wave 2 only uses this to advertise an "active" provider in
+# `hermes provider list`; full SDK routing inside _call_chat_completions
+# is gated by §2.4 wave 3 (driven by an actual Claude usage signal).
+
+_ANTHROPIC_HOSTS = ("api.anthropic.com",)
+_BEDROCK_HOSTS = ("bedrock-runtime",)  # appears as bedrock-runtime.<region>.amazonaws.com
+_GEMINI_HOSTS = ("generativelanguage.googleapis.com", "aiplatform.googleapis.com")
+_CODEX_HOSTS = ("api.openai.com/v1/responses",)
+
+
+def _detect_provider(base_url: str) -> str:
+    """Map a base_url to a provider name.
+
+    Defaults to ``"openai-compatible"`` (which serves OpenAI proper,
+    Ollama, vLLM, LM Studio, Together, Groq, …).  Returns ``"anthropic"``
+    only when the URL points at api.anthropic.com — Bedrock / Vertex
+    flavours of Claude need their own adapters and aren't detected here.
+    """
+    url = (base_url or "").lower()
+    if not url:
+        return "openai-compatible"
+    for host in _ANTHROPIC_HOSTS:
+        if host in url:
+            return "anthropic"
+    for host in _BEDROCK_HOSTS:
+        if host in url:
+            return "bedrock"
+    for host in _GEMINI_HOSTS:
+        if host in url:
+            return "gemini"
+    for host in _CODEX_HOSTS:
+        if host in url:
+            return "codex"
+    return "openai-compatible"
+
+
 # ── Tool registry plumbing ──────────────────────────────────────────────
 # Phase 2.1.4 will provide tools.registry.  Until then ``_load_tool_registry``
 # returns None and the agent runs in tool-less mode (still a valid loop).
@@ -366,12 +509,22 @@ class AIAgent:
         max_tokens: Optional[int] = None,
         ephemeral_system_prompt: Optional[str] = None,
         iteration_budget: Optional[IterationBudget] = None,
+        provider: Optional[str] = None,
     ):
         """Initialize the AI Agent.
 
         Phase 1 keeps a minimal parameter surface — Phases 2+ reintroduce
-        the dropped knobs (provider, providers_*, callbacks, fallback_model,
+        the dropped knobs (providers_*, callbacks, fallback_model,
         credential_pool, prefill_messages, …) as they become relevant.
+
+        ``provider`` overrides the auto-detection in
+        ``_detect_provider``.  Pass it explicitly when you want to force
+        a route (e.g. ``provider="anthropic"`` against an Anthropic-compatible
+        base_url).  The ``"anthropic"`` route is fully wired through
+        ``_call_anthropic_messages`` — non-streaming via ``messages.create``
+        (§2.4 wave 3) and event-based streaming via ``messages.stream``
+        (§2.4 wave 4).  ``"bedrock" / "codex" / "gemini"`` are still
+        advertised-only — those adapters remain unported.
         """
         _install_safe_stdio()
 
@@ -389,10 +542,16 @@ class AIAgent:
         self.base_url = base_url or os.environ.get("OPENAI_BASE_URL", "")
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.session_id = session_id or str(uuid.uuid4())
+        self.provider = provider or _detect_provider(self.base_url)
 
         # Lazy-built OpenAI client; created on first API call.
         self._client = None
         self._client_lock = threading.RLock()
+
+        # Lazy-built Anthropic client (§2.4 wave 3) — only constructed
+        # when self.provider == "anthropic" hits its first API call.
+        self._anthropic_client = None
+        self._anthropic_client_lock = threading.RLock()
 
         # Per-turn state — reset at the start of each run_conversation.
         self._current_task_id: Optional[str] = None
@@ -452,13 +611,39 @@ class AIAgent:
                 self._client = OpenAI(**self._build_client_kwargs())
             return self._client
 
+    def _get_anthropic_client(self):
+        """Return a cached Anthropic SDK client, building on first call.
+
+        Routed via ``agent.anthropic_adapter.build_anthropic_client`` so
+        proxy normalization / OAuth / Claude Code beta headers all flow
+        through the same code path the upstream uses.
+        """
+        with self._anthropic_client_lock:
+            if self._anthropic_client is None:
+                from agent.anthropic_adapter import build_anthropic_client
+                self._anthropic_client = build_anthropic_client(
+                    self._api_key,
+                    self._base_url or None,
+                )
+            return self._anthropic_client
+
     def close(self) -> None:
-        """Close any cached OpenAI client.  Safe to call multiple times."""
+        """Close any cached SDK clients.  Safe to call multiple times."""
         with self._client_lock:
             client = self._client
             self._client = None
         if client is not None:
             close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        with self._anthropic_client_lock:
+            ant = self._anthropic_client
+            self._anthropic_client = None
+        if ant is not None:
+            close = getattr(ant, "close", None)
             if callable(close):
                 try:
                     close()
@@ -764,43 +949,51 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
     ) -> Any:
-        """Invoke chat.completions.create with retries on retryable errors.
+        """Invoke the model API with retries on retryable errors.
 
-        When ``self._stream_callback`` is set, the SDK is asked to stream and
-        the resulting chunks are accumulated into a non-streaming-shaped
-        object (``response.choices[0].message.content`` / ``.tool_calls`` /
-        ``.finish_reason``) so the rest of ``run_conversation`` keeps working
-        unchanged.  Each text delta is forwarded to the callback live so a
-        TTY / TTS consumer can show progress before the full reply lands.
+        When ``self.provider == "anthropic"``, dispatches to
+        ``_call_anthropic_messages``; the Anthropic Messages response is
+        wrapped in a ``SimpleNamespace`` shaped like an OpenAI ChatCompletion
+        so the rest of ``run_conversation`` is provider-agnostic.
+
+        Otherwise calls ``client.chat.completions.create``.  When
+        ``self._stream_callback`` is set the SDK is asked to stream and the
+        resulting chunks are accumulated into the same non-streaming-shaped
+        object; each text delta is forwarded to the callback live so a TTY
+        / TTS consumer can show progress before the full reply lands.  The
+        anthropic route uses ``client.messages.stream(...)`` (event-based
+        protocol — see ``_accumulate_anthropic_stream``); the OpenAI-compat
+        route uses ``stream=True`` on ``chat.completions.create``.
 
         Retries are gated by ``self.iteration_budget.remaining`` so an
         agent stuck in retry loops cannot exceed its budget.
         """
-        client = self._get_openai_client()
-
-        api_kwargs: Dict[str, Any] = {
-            "model": self.model,
-            "messages": messages,
-        }
-        if tools:
-            api_kwargs["tools"] = tools
-        if self.max_tokens is not None:
-            api_kwargs["max_tokens"] = self.max_tokens
-
         stream_callback: Optional[Callable[[str], None]] = self._stream_callback
+        is_anthropic = self.provider == "anthropic"
 
         attempt = 0
         last_exc: Optional[Exception] = None
         while True:
             attempt += 1
             try:
+                if is_anthropic:
+                    return self._call_anthropic_messages(messages, tools, stream_callback)
+                client = self._get_openai_client()
+                api_kwargs: Dict[str, Any] = {
+                    "model": self.model,
+                    "messages": messages,
+                }
+                if tools:
+                    api_kwargs["tools"] = tools
+                if self.max_tokens is not None:
+                    api_kwargs["max_tokens"] = self.max_tokens
                 if stream_callback is None:
                     return client.chat.completions.create(**api_kwargs)
                 stream = client.chat.completions.create(stream=True, **api_kwargs)
                 return _accumulate_stream(stream, stream_callback)
             except Exception as exc:
                 last_exc = exc
-                classified = _classify_error(exc, model=self.model)
+                classified = _classify_error(exc, provider=self.provider, model=self.model)
                 if not getattr(classified, "retryable", True):
                     logger.warning("non-retryable API error: %s", exc)
                     raise
@@ -813,6 +1006,47 @@ class AIAgent:
 
         # Unreachable; mypy guard.
         raise last_exc if last_exc else RuntimeError("unreachable")
+
+    def _call_anthropic_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        stream_callback: Optional[Callable[[str], None]] = None,
+    ) -> Any:
+        """Send one Anthropic ``messages.create`` round-trip.
+
+        Builds the API kwargs through ``build_anthropic_kwargs`` (handles
+        message / tool format conversion, system-prompt extraction, output
+        token resolution) and converts the response into the OpenAI
+        ChatCompletion-shaped ``SimpleNamespace`` the run loop already
+        knows how to unpack.
+
+        When ``stream_callback`` is set, ``messages.stream(...)`` is used
+        instead and ``_accumulate_anthropic_stream`` forwards each
+        ``text_delta`` to the callback live before assembling the final
+        message via ``stream.get_final_message()`` (§2.4 wave 4).
+
+        OAuth / Bedrock / fast_mode / reasoning are all left at their
+        defaults — those wirings come on demand.
+        """
+        from agent.anthropic_adapter import build_anthropic_kwargs
+
+        api_kwargs = build_anthropic_kwargs(
+            model=self.model,
+            messages=messages,
+            tools=list(tools) if tools else None,
+            max_tokens=self.max_tokens,
+            reasoning_config=None,
+            base_url=self._base_url or None,
+        )
+        client = self._get_anthropic_client()
+        if stream_callback is None:
+            response = client.messages.create(**api_kwargs)
+            return _anthropic_response_to_openai_shape(response)
+        return _accumulate_anthropic_stream(
+            client.messages.stream(**api_kwargs),
+            stream_callback,
+        )
 
     # ── main conversation loop ───────────────────────────────────────
 

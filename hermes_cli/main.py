@@ -51,6 +51,7 @@ class _Flags:
     model: Optional[str] = None
     base_url: Optional[str] = None
     api_key: Optional[str] = None
+    provider: Optional[str] = None
 
 
 # ── Argparse wiring ────────────────────────────────────────────────────
@@ -75,6 +76,9 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="OpenAI-compatible endpoint base URL")
     parser.add_argument("--api-key", dest="api_key", default=None,
                         help="API key (overrides env)")
+    parser.add_argument("--provider", default=None,
+                        choices=["openai-compatible", "anthropic", "bedrock", "codex", "gemini"],
+                        help="force a specific provider (overrides base_url-based auto-detection)")
 
     sub = parser.add_subparsers(dest="cmd", metavar="<command>")
 
@@ -274,6 +278,7 @@ def _build_agent(args: argparse.Namespace, *,
         verbose_logging=_Flags.debug,
         quiet_mode=_Flags.quiet,
         ephemeral_system_prompt=system,
+        provider=_Flags.provider,
     )
 
 
@@ -632,23 +637,39 @@ def cmd_provider_help(args: argparse.Namespace) -> int:
 def cmd_provider_list(args: argparse.Namespace) -> int:
     """List the adapters phalanx currently knows about.
 
-    Phase 2.4 wave 1 has only the OpenAI-compatible path wired up
-    (which serves OpenAI proper, Ollama, vLLM, LM Studio, plus any
-    drop-in via base_url override).  Anthropic / Bedrock / Codex /
-    Gemini adapters land in wave 2 on demand.
+    The active row is whatever ``run_agent._detect_provider(base_url)``
+    resolves to (overridable via ``--provider``).  Wave 1 wired the
+    OpenAI-compatible path; wave 2 ported the anthropic adapter module;
+    wave 3 dispatches anthropic API calls through the SDK
+    (``_call_anthropic_messages``).  Streaming on the anthropic route is
+    still non-streaming-only — the wire protocol differs from OpenAI's
+    SSE and lands in wave 4.
     """
+    from run_agent import _detect_provider
+
     cfg = load_config()
     base_url = (
-        os.environ.get("OPENAI_BASE_URL")
+        _Flags.base_url
+        or os.environ.get("OPENAI_BASE_URL")
         or cfg_get(cfg, "model", "base_url", default="")
-        or "<unset>"
+        or ""
     )
+    detected = _Flags.provider or _detect_provider(base_url)
+
+    statuses = {
+        "openai-compatible": "wired (chat.completions, streaming)",
+        "anthropic": "wired (messages.create + messages.stream)",
+        "bedrock": "not yet ported",
+        "codex": "not yet ported",
+        "gemini": "not yet ported",
+    }
+    print(f"base_url: {base_url or '<unset>'}")
+    print(f"detected: {detected}" + ("  (forced via --provider)" if _Flags.provider else ""))
+    print()
     print("adapters:")
-    print(f"  openai-compatible    base_url={base_url}    [active]")
-    print("  anthropic            (not yet ported — §2.4 wave 2)")
-    print("  bedrock              (not yet ported)")
-    print("  codex                (not yet ported)")
-    print("  gemini               (not yet ported)")
+    for name, status in statuses.items():
+        marker = "  [active]" if name == detected else ""
+        print(f"  {name:<20s} {status}{marker}")
     return 0
 
 
@@ -658,11 +679,17 @@ def cmd_provider_test(args: argparse.Namespace) -> int:
     Builds a one-off AIAgent (no tools, max_iterations=1, no streaming)
     and runs a single-turn conversation with a "ping" message.  Reports
     pass/fail with the round-trip latency.
+
+    Routes by provider name (matched against ``run_agent._detect_provider``
+    output): ``openai-compatible`` and ``anthropic`` are wired (§2.4 waves
+    1 + 3); ``bedrock`` / ``codex`` / ``gemini`` are still rejected up
+    front rather than letting them 404 / hang against the wrong endpoint.
     """
-    if args.name != "openai-compatible":
+    _SUPPORTED = {"openai-compatible", "anthropic"}
+    if args.name not in _SUPPORTED:
         sys.stderr.write(
             f"error: provider {args.name!r} is not yet wired up. "
-            "Only 'openai-compatible' is active in this build.\n"
+            "Active providers in this build: " + ", ".join(sorted(_SUPPORTED)) + "\n"
         )
         return 2
 
@@ -696,6 +723,7 @@ def cmd_provider_test(args: argparse.Namespace) -> int:
     agent = AIAgent(
         base_url=base_url, api_key=api_key, model=model,
         max_iterations=1, quiet_mode=True,
+        provider=args.name,
     )
     import time as _t
     t0 = _t.perf_counter()
@@ -886,6 +914,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _Flags.model = getattr(args, "model", None)
     _Flags.base_url = getattr(args, "base_url", None)
     _Flags.api_key = getattr(args, "api_key", None)
+    _Flags.provider = getattr(args, "provider", None)
 
     _setup_logging(_Flags.debug)
     _load_dotenv_best_effort()

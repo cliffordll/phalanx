@@ -10,7 +10,12 @@ from __future__ import annotations
 import json
 
 from hermes_cli.main import main as cli_main
-from tests.conftest import make_text_response, make_tool_response
+from tests.conftest import (
+    make_anthropic_text_response,
+    make_anthropic_tool_response,
+    make_text_response,
+    make_tool_response,
+)
 
 
 # ── version ──────────────────────────────────────────────────────────
@@ -292,12 +297,58 @@ def test_provider_test_pings_and_reports_ok(stub_openai, capsys):
 
 
 def test_provider_test_unknown_provider_rejects(monkeypatch, capsys):
+    """bedrock/codex/gemini are still rejected up front (wave 3 ships only anthropic)."""
     monkeypatch.setenv("PHALANX_MODEL", "gpt-test")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
-    rc = cli_main(["provider", "test", "anthropic"])
+
+    for unsupported in ("bedrock", "codex", "gemini"):
+        rc = cli_main(["provider", "test", unsupported])
+        captured = capsys.readouterr()
+        assert rc == 2, f"{unsupported} should be rejected"
+        assert "not yet wired up" in captured.err
+
+
+def test_detect_provider_resolves_known_hosts():
+    """Module-level _detect_provider maps a base_url to its adapter name."""
+    from run_agent import _detect_provider
+
+    assert _detect_provider("") == "openai-compatible"
+    assert _detect_provider(None) == "openai-compatible"  # type: ignore[arg-type]
+    assert _detect_provider("http://localhost:11434/v1") == "openai-compatible"
+    assert _detect_provider("https://api.openai.com/v1") == "openai-compatible"
+    assert _detect_provider("https://api.anthropic.com") == "anthropic"
+    assert _detect_provider("https://API.ANTHROPIC.com/v1") == "anthropic"  # case-insensitive
+    assert _detect_provider("https://bedrock-runtime.us-east-1.amazonaws.com") == "bedrock"
+    assert _detect_provider("https://generativelanguage.googleapis.com/v1beta") == "gemini"
+    assert _detect_provider("https://api.openai.com/v1/responses") == "codex"
+
+
+def test_provider_flag_overrides_autodetect(stub_openai, capsys):
+    """`hermes --provider anthropic provider list` shows the forced override."""
+    rc = cli_main([
+        "--model", "gpt-test", "--base-url", "http://localhost:11434/v1",
+        "--provider", "anthropic",
+        "provider", "list",
+    ])
     captured = capsys.readouterr()
-    assert rc == 2
-    assert "not yet wired up" in captured.err
+    assert rc == 0
+    assert "detected: anthropic" in captured.out
+    assert "forced via --provider" in captured.out
+
+
+def test_provider_list_marks_anthropic_active_for_anthropic_url(stub_openai, capsys):
+    """Auto-detection: pointing base_url at anthropic.com flips [active]."""
+    rc = cli_main([
+        "--model", "claude", "--base-url", "https://api.anthropic.com",
+        "provider", "list",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    # The [active] marker should be on the anthropic row, not openai-compatible.
+    anthropic_line = next(
+        line for line in captured.out.splitlines() if line.lstrip().startswith("anthropic")
+    )
+    assert "[active]" in anthropic_line
 
 
 def test_model_switch_writes_config(monkeypatch, tmp_path, capsys):
@@ -320,3 +371,176 @@ def test_model_switch_writes_config(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert rc == 0
     assert "qwen2.5:1.5b → claude-3-5-sonnet" in captured.out
+
+
+# ── §2.4 wave 3: anthropic SDK routing ───────────────────────────────
+
+
+def test_anthropic_response_to_openai_shape_text_only():
+    """Pure-text Anthropic responses normalize to a single .choices[0]."""
+    from run_agent import _anthropic_response_to_openai_shape
+
+    resp = _anthropic_response_to_openai_shape(make_anthropic_text_response("hi"))
+    assert resp.choices[0].message.content == "hi"
+    assert resp.choices[0].message.tool_calls is None
+    assert resp.choices[0].finish_reason == "stop"
+
+
+def test_anthropic_response_to_openai_shape_tool_use():
+    """tool_use blocks become OpenAI-shape tool_calls with JSON arguments."""
+    from run_agent import _anthropic_response_to_openai_shape
+
+    raw = make_anthropic_tool_response(
+        text="thinking out loud",
+        tool_calls=[("toolu_abc", "echo", {"text": "hi"})],
+    )
+    resp = _anthropic_response_to_openai_shape(raw)
+    assert resp.choices[0].finish_reason == "tool_calls"
+    assert resp.choices[0].message.content == "thinking out loud"
+    tcs = resp.choices[0].message.tool_calls
+    assert len(tcs) == 1
+    assert tcs[0].id == "toolu_abc"
+    assert tcs[0].function.name == "echo"
+    assert json.loads(tcs[0].function.arguments) == {"text": "hi"}
+
+
+def test_anthropic_stop_reason_mapping():
+    """Anthropic stop_reasons map to OpenAI finish_reasons (max_tokens → length, etc.)."""
+    from run_agent import _anthropic_response_to_openai_shape
+    from tests.conftest import FakeAnthropicResponse, FakeAnthropicTextBlock
+
+    cases = {
+        "end_turn": "stop",
+        "tool_use": "tool_calls",
+        "max_tokens": "length",
+        "stop_sequence": "stop",
+        "refusal": "content_filter",
+        "model_context_window_exceeded": "length",
+        "something-the-api-added-later": "stop",  # unmapped → "stop"
+    }
+    for raw, expected in cases.items():
+        resp = _anthropic_response_to_openai_shape(
+            FakeAnthropicResponse([FakeAnthropicTextBlock("x")], raw)
+        )
+        assert resp.choices[0].finish_reason == expected, raw
+
+
+def test_provider_test_anthropic_routes_through_anthropic_sdk(
+    stub_anthropic, capsys, monkeypatch,
+):
+    """`hermes provider test anthropic` exercises the wave-3 routing end-to-end."""
+    monkeypatch.setenv("PHALANX_MODEL", "claude-3-5-sonnet")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    stub = stub_anthropic([make_anthropic_text_response("pong")])
+
+    rc = cli_main(["provider", "test", "anthropic"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "OK" in captured.out
+    assert "pong" in captured.out
+    # Round-trip went through the Anthropic SDK stub.
+    assert len(stub.calls) == 1
+    assert stub.calls[0]["model"]  # api kwargs reached messages.create
+
+
+def test_oneshot_anthropic_provider_drives_full_flow(stub_anthropic, capsys):
+    """`oneshot --provider anthropic` runs the full run_conversation through anthropic."""
+    stub = stub_anthropic([make_anthropic_text_response("hi from claude")])
+    rc = cli_main([
+        "--model", "claude-3-5-sonnet",
+        "--api-key", "sk-x",
+        "--base-url", "https://api.anthropic.com",
+        "--provider", "anthropic",
+        "oneshot", "say hi",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "hi from claude" in captured.out
+    # api_kwargs had the system prompt extracted and messages array built.
+    kwargs = stub.calls[0]
+    assert kwargs["model"]  # build_anthropic_kwargs ran normalize_model_name
+    assert isinstance(kwargs["messages"], list)
+    # convert_messages_to_anthropic pulls system messages into a separate
+    # "system" kwarg — phalanx's build_system_prompt always provides one.
+    assert "system" in kwargs
+
+
+def test_accumulate_anthropic_stream_forwards_text_deltas():
+    """text_delta events fire the callback in order; final message wins for shape."""
+    from run_agent import _accumulate_anthropic_stream
+    from tests.conftest import (
+        FakeAnthropicStream,
+        FakeAnthropicStreamEvent,
+        make_anthropic_text_delta_event,
+        make_anthropic_text_response,
+    )
+
+    events = [
+        FakeAnthropicStreamEvent("message_start"),
+        FakeAnthropicStreamEvent("content_block_start"),
+        make_anthropic_text_delta_event("hi "),
+        make_anthropic_text_delta_event("there"),
+        FakeAnthropicStreamEvent("content_block_stop"),
+        FakeAnthropicStreamEvent("message_stop"),
+    ]
+    final = make_anthropic_text_response("hi there")
+    stream = FakeAnthropicStream(events, final)
+
+    seen: list = []
+    response = _accumulate_anthropic_stream(stream, seen.append)
+
+    assert seen == ["hi ", "there"]
+    assert response.choices[0].message.content == "hi there"
+    assert response.choices[0].finish_reason == "stop"
+
+
+def test_accumulate_anthropic_stream_callback_failure_does_not_break_run(caplog):
+    """A buggy stream callback is logged but doesn't prevent get_final_message."""
+    import logging
+    from run_agent import _accumulate_anthropic_stream
+    from tests.conftest import (
+        FakeAnthropicStream,
+        make_anthropic_text_delta_event,
+        make_anthropic_text_response,
+    )
+
+    caplog.set_level(logging.ERROR, logger="run_agent")
+    stream = FakeAnthropicStream(
+        [make_anthropic_text_delta_event("A"), make_anthropic_text_delta_event("B")],
+        make_anthropic_text_response("AB"),
+    )
+
+    def bad_callback(_d: str) -> None:
+        raise RuntimeError("ui crashed")
+
+    response = _accumulate_anthropic_stream(stream, bad_callback)
+    assert response.choices[0].message.content == "AB"
+
+
+def test_oneshot_anthropic_streaming_drives_real_stream(stub_anthropic, capsys):
+    """--stream on the anthropic route now drives messages.stream() for real."""
+    from tests.conftest import make_anthropic_text_delta_event
+
+    events = [
+        make_anthropic_text_delta_event("hi "),
+        make_anthropic_text_delta_event("from "),
+        make_anthropic_text_delta_event("claude"),
+    ]
+    final = make_anthropic_text_response("hi from claude")
+    stub = stub_anthropic([(events, final)])
+
+    rc = cli_main([
+        "--model", "claude-3-5-sonnet",
+        "--api-key", "sk-x",
+        "--base-url", "https://api.anthropic.com",
+        "--provider", "anthropic",
+        "oneshot", "--stream", "hi",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    # Streaming wrote the deltas to stdout in order, then a trailing newline.
+    assert captured.out == "hi from claude\n"
+    # And we hit messages.stream(), not messages.create().
+    assert len(stub.stream_calls) == 1
+    assert len(stub.calls) == 0
