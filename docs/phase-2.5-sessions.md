@@ -13,7 +13,7 @@
 | Wave | 内容 | 提交 |
 |---|---|---|
 | 1 | `hermes_state.py` 骨架 — schema + 连接 + `_execute_write` jitter 重试 + `_init_schema`（含 `_reconcile_columns` / FTS5）+ 9 个核心 CRUD 方法（`create_session` / `end_session` / `reopen_session` / `ensure_session` / `get_session` / `update_system_prompt` / `update_token_counts` / `append_message` / `get_messages`）+ `_encode_content` / `_decode_content` | `c42a4fe` |
-| 2 | `run_agent.py` 主循环接 SessionDB — `_ensure_db_session` + `_persist_messages_to_db` flush 点 + `AIAgent.__init__` 接 `_session_db` / `_session_db_created` / `_last_flushed_db_idx` + DB 故障 try/except 不打断对话 | uncommitted |
+| 2 | `run_agent.py` 主循环接 SessionDB — `_ensure_db_session` + `_persist_messages_to_db` flush 点 + `AIAgent.__init__` 接 `_session_db` / `_session_db_created` / `_last_flushed_db_idx` + DB 故障 try/except 不打断对话 | `684154d` |
 | 3 | Resume 路径 — `resolve_session_id`（前缀解析）+ `resolve_resume_session_id`（compression 链跟进）+ `get_messages_as_conversation` + `_session_lineage_root_to_tip` + `_is_duplicate_replayed_user_message` + 主循环 `--resume <id>` 接入 | uncommitted |
 | 4 | `session list/show/dump/delete` 子命令 — `list_sessions_rich`（裁剪：去掉 compression 投影 + `order_by_last_active` CTE）+ `_get_session_rich_row` + 渲染逻辑（preview / last_active / token 总量） | uncommitted |
 | 5 | `hermes_cli/logs.py` 移植 — `tail_log` / `_read_tail` / `_read_last_n_lines` / `_follow_log` / `list_logs` + `--session` / `--component` / `--since` / `--level` 过滤 + `logs` 子命令 | uncommitted |
