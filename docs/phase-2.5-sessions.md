@@ -14,9 +14,9 @@
 |---|---|---|
 | 1 | `hermes_state.py` 骨架 — schema + 连接 + `_execute_write` jitter 重试 + `_init_schema`（含 `_reconcile_columns` / FTS5）+ 9 个核心 CRUD 方法（`create_session` / `end_session` / `reopen_session` / `ensure_session` / `get_session` / `update_system_prompt` / `update_token_counts` / `append_message` / `get_messages`）+ `_encode_content` / `_decode_content` | `c42a4fe` |
 | 2 | `run_agent.py` 主循环接 SessionDB — `_ensure_db_session` + `_persist_messages_to_db` flush 点 + `AIAgent.__init__` 接 `_session_db` / `_session_db_created` / `_last_flushed_db_idx` + DB 故障 try/except 不打断对话 | `684154d` |
-| 3 | Resume 路径 — `resolve_session_id`（前缀解析）+ `resolve_resume_session_id`（compression 链跟进）+ `get_messages_as_conversation` + `_session_lineage_root_to_tip` + `_is_duplicate_replayed_user_message` + 主循环 `--resume <id>` 接入 | uncommitted |
-| 4 | `session list/show/dump/delete` 子命令 — `list_sessions_rich`（裁剪：去掉 compression 投影 + `order_by_last_active` CTE）+ `_get_session_rich_row` + 渲染逻辑（preview / last_active / token 总量） | uncommitted |
-| 5 | `hermes_cli/logs.py` 移植 — `tail_log` / `_read_tail` / `_read_last_n_lines` / `_follow_log` / `list_logs` + `--session` / `--component` / `--since` / `--level` 过滤 + `logs` 子命令 | uncommitted |
+| 3 | Resume 路径 — `resolve_session_id`（前缀解析）+ `resolve_resume_session_id`（compression 链跟进）+ `get_messages_as_conversation` + `_session_lineage_root_to_tip` + `_is_duplicate_replayed_user_message` + 主循环 `--resume <id>` 接入 | `cff4ad9` |
+| 4 | `session list/show/dump/delete` 子命令 — `list_sessions_rich`（裁剪：去掉 compression 投影 + `order_by_last_active` CTE）+ `_get_session_rich_row` + `delete_session`（orphan child）+ CLI 渲染（preview / last_active / token 总量 / JSONL dump / `--yes` 守卫） | `6315549` |
+| 5 | `hermes_cli/logs.py` 移植 — `tail_log` / `_read_tail` / `_read_last_n_lines` / `_follow_log` / `list_logs` + `--session` / `--component` / `--since` / `--level` 过滤 + `logs` 子命令 | `2aee4b5` |
 
 §2.5 落地后 phalanx 单进程 CLI 即可创建 / 列举 / 续聊 / 导出会话；gateway 多进程并发下的 WAL contention 路径（`_try_wal_checkpoint`）一并就位。
 
@@ -32,7 +32,7 @@ isolation_level = None        # 应用层自管理事务（BEGIN IMMEDIATE）
 timeout = 1.0s                # SQLite 内置 busy handler 短超时
 ```
 
-phalanx 沿用 `hermes_constants.get_hermes_home()`（即 `~/.hermes/`），不另起 `~/.phalanx/`——为后续与 hermes 上游补丁互操作。
+phalanx 沿用 `hermes_constants.get_hermes_home()`（即 `~/.hermes/`），不另起 `~/.phalanx/`——为后续与 hermes 上游补丁互操作。`DEFAULT_DB_PATH` 仅作模块级常量留作 monkeypatch 锚点；实际路径在 `SessionDB.__init__` 里**懒解析**（`db_path or get_hermes_home() / "state.db"`），让测试的 `PHALANX_HOME` env override 在模块 import 之后还能即时生效。
 
 ### 1.2 三张主表 + 两张 FTS5 虚拟表
 
@@ -167,15 +167,36 @@ phalanx CLI 路径走 `absolute=False`，每轮 `_make_api_call` 拿到 `respons
 - `_encode_content` / `_decode_content` / `append_message` / `replace_messages` / `get_messages`
 
 ### 3.2 必移（resume，wave 3）
-- `resolve_session_id`（前缀匹配，CLI 用户友好）
-- `resolve_resume_session_id`（compression 链跟进——单线 phalanx 暂不会触发，但代码留着，等 §2.7）
-- `get_messages_as_conversation`
-- `_session_lineage_root_to_tip`
-- `_is_duplicate_replayed_user_message`
 
-### 3.3 必移（list/show，wave 4）
-- `list_sessions_rich`（**裁剪**：去掉 `order_by_last_active=True` 的 CTE 分支 + `project_compression_tips` 投影逻辑——单线 phalanx 用不上 compression 链投影；保留默认 `started_at DESC` 简单分页）
-- `_get_session_rich_row`
+| 方法 | 输入 → 输出 | 关键行为 |
+|---|---|---|
+| `resolve_session_id(s)` | `str` → `Optional[str]` | 先 `get_session(s)` 走精确匹配；miss 后用 `LIKE 's%' ESCAPE '\\'` + `LIMIT 2` 检测唯一前缀。**LIKE 元字符 `%` / `_` / `\` 在拼前先转义**，否则 `--resume "%"` 会匹配所有会话。≥2 命中或 0 命中都返回 `None`，CLI 据此报 "no matching session"。 |
+| `resolve_resume_session_id(sid)` | `str` → `str` | 先看 `sid` 自己有没有 message 行——有就直接返回（绝大多数情况）。无则沿 `parent_session_id` 反向（实际是 `WHERE parent_session_id = current` 找子节点）走 compression 链，每跳挑 `started_at` 最新的 child；找到第一个有 message 的子节点即返回。**32 hop 上限** + `seen` 集合防环。phalanx 当前 compressor 是 stub，链一定空，函数永远走第一条 fast path——但接口留好，§2.7 启用 compression 时直接生效。 |
+| `get_messages_as_conversation(sid, include_ancestors=False)` | `str` → `List[Dict]` | 把 DB 行翻译回 OpenAI message 形态：仅保留 `role`/`content`/`tool_call_id`/`tool_name`/`tool_calls` 等模型实际看到的字段，**剥掉 `id` / `timestamp` / `token_count` 等 db 元数据**。`user`/`assistant` 的 string content 走 `agent.memory_manager.sanitize_context` + `.strip()`。assistant 行额外恢复 `finish_reason` / `reasoning` / `reasoning_content` / `reasoning_details` / `codex_*_items`（缺一份就让 OpenRouter / Codex 多轮思考链断掉）。坏 JSON 降级到 `[]` / `None` + warn——单条腐败不让整段重放挂掉。`include_ancestors=True` 时拼整个 lineage 链，并对接缝处的重复 user prompt 调下面那个 helper 去重。 |
+| `_session_lineage_root_to_tip(sid)` | `str` → `List[str]` | 沿 `parent_session_id` 一路向上找根，返回 `[root, ..., tip]` 顺序（保证回放顺序自然）。**100 hop 上限** + `seen` 集合：上游观察过用户手工乱接 `parent_session_id` 形成环，必须有兜底。 |
+| `_is_duplicate_replayed_user_message(messages, msg)` | `(List[Dict], Dict)` → `bool` | 静态方法。仅当 `msg.role == "user"` 且 content 是非空字符串时才有可能 True。从 `messages` 末尾倒着扫：碰到内容相同的另一条 user → True（接缝重复）；碰到带 `content` 或 `tool_calls` 的 assistant → False（中间确有进展，是真新轮）。**lineage 接缝场景**：父 session 末轮是 "user: foo"，compression 后 child 重放也以 "user: foo" 开头——不去重就会双发同一句。 |
+
+**主循环接入**（wave 3）：
+- `cli_main(["--resume", "<id-or-prefix>", "oneshot", ...])` 顶层 flag
+- `_build_agent` 无条件构造 `SessionDB`（让每次 CLI 都落库），`--resume` 时调 `resolve_session_id` → `resolve_resume_session_id` → `get_messages_as_conversation` 三连，再 `reopen_session` 让目标会话能继续记录 `end_session`
+- 解析失败（无匹配 / 前缀歧义）走 `sys.exit(2)` + stderr 友好提示
+- `cmd_oneshot` 把 history 透传给 `run_conversation(conversation_history=...)`；主循环里的 `_persist_messages_to_db` 自动跳过 `len(history)` 之前的索引，**不会重写历史**
+
+### 3.3 必移（list/show/delete，wave 4）
+
+| 方法 | 输入 → 输出 | 关键行为 |
+|---|---|---|
+| `list_sessions_rich(source=None, exclude_sources=None, limit=20, offset=0, include_children=False)` | filters → `List[Dict]` | `hermes session list` 的数据来源。在 `sessions.*` 之外多算两列：`preview`（首条 user message 前 60 字符 + `\n` / `\r` 扁平化为空格 + 超长加 `...`）、`last_active`（`MAX(messages.timestamp)`，无 message 回退到 `started_at`）。**裁剪**：去掉上游 `order_by_last_active=True` 的递归 CTE 分支（依赖 compression chain）+ `project_compression_tips` 投影；`started_at DESC` 简单分页。`include_children=False`（默认）排除 sub-agent run（parent 还活着时开的子 session）；branch session（`parent.end_reason='branched'` 之后开的）保留可见。 |
+| `_get_session_rich_row(sid)` | `str` → `Optional[Dict]` | 单行版本，给 `session show` 用。同样附 `preview` + `last_active`，session 不存在返 `None`。 |
+| `delete_session(sid)` | `str` → `bool` | 一个 transaction 内 `DELETE FROM messages` → `DELETE FROM sessions`。**子 session 走 orphan**：`UPDATE ... SET parent_session_id = NULL`，不级联删除——避免 compression chain 里删 ancestor 把 live tip 一起带走。返回是否真删了（不存在返 False）。 |
+
+**CLI 接入**（wave 4，`hermes_cli/main.py`）：
+- `cmd_session_list` — 默认表格视图 `ID(8) SOURCE MODEL MSGS LAST PREVIEW` 六列；`--json` 直出 dict 数组（管道 / jq 友好）；`--source` / `--limit` 透传给查询。
+- `_format_session_age(ts)` — 把 epoch 时间戳渲成 `"3m ago"` / `"2h ago"` / `"4d ago"`，给表格的 `LAST` 列。
+- `_resolve_session_target(target)` — 三个 cmd（show/dump/delete）共用：开 DB → `resolve_session_id(target)` 把前缀解析成全 id → 失败 `sys.exit(2)` + stderr 友好提示。
+- `cmd_session_show` — 顶部 metadata（id / source / model / started / ended+reason / 计数 / token 总量 / preview），下面遍历 messages 以 `--- [n] role ---` 分隔；content 超 500 字符截断（完整内容走 `dump`）。
+- `cmd_session_dump` — 每条 message 一行 JSON（JSONL 格式），保留所有 db 字段；脚本管道用。
+- `cmd_session_delete` — 没带 `--yes` → dry-run（stderr 提示 + exit 1，DB 不动）；带 `--yes` 才真调 `delete_session`。
 
 ### 3.4 暂不移（gateway/compression 专属）
 - Title 全套 6 个：`sanitize_title` / `set_session_title` / `get_session_title` / `get_session_by_title` / `resolve_session_by_title` / `get_next_title_in_lineage`——/save 命令依赖，§2.6 REPL 落地时再加
@@ -265,11 +286,29 @@ hermes logs --since 1h
 hermes logs list                     # 列出 ~/.hermes/logs/ 下所有 *.log
 ```
 
-logs CLI **不依赖 SessionDB**——纯文本文件 tail/filter。session_id 过滤靠 `hermes_logging.set_session_context()` 在每条日志行注入的 `[sess_xxx]` 标签做子串匹配（这套已在 phalanx 现有 `_set_session_log_context` 路径里就位）。
+logs CLI **不依赖 SessionDB**——纯文本文件 tail/filter。session_id 过滤靠 `hermes_logging.set_session_context()` 在每条日志行注入的 `[sess_xxx]` 标签做子串匹配（这套已在 phalanx 现有 `_set_session_log_context` 路径里就位）。`hermes_cli/logs.py` 几乎逐字 verbatim 移自上游，无 agent 依赖。
+
+**logs.py 函数表**：
+
+| 函数 | 输入 → 输出 | 关键行为 |
+|---|---|---|
+| `tail_log(name, num_lines, follow, level, session, since, component)` | flags → exit code | 顶层入口。校验 `name` 在 `LOG_FILES`（agent/errors/gateway）、`since` 能解析、`level` 在 `_LEVEL_ORDER`、`component` 在 `COMPONENT_PREFIXES`，任一失败 stderr 报错 + 返非零。Header 回显被激活的过滤集，方便用户确认 "正在看哪些行"。`follow=True` 时打印 header 后转 `_follow_log`，`Ctrl+C` 优雅退出。 |
+| `_read_tail(path, n, has_filters, ...)` | Path + filters → `List[str]` | 有过滤时**多读 20 倍** raw lines（保底 2000）以保证过滤后还剩 N 条；无过滤直接 `_read_last_n_lines(path, n)`。 |
+| `_read_last_n_lines(path, n)` | Path → `List[str]` | 文件 ≤1MB 全读；>1MB 走**倍增分块尾部反读**（8K → 16K → 32K → 64K 上限），合并跨 chunk 的半行；任何异常降级到全文件读。 |
+| `_follow_log(path, ...)` | Path → never returns | `seek(0, 2)` 跳到文件尾，0.3 秒轮询 `readline()`；新行通过 `_matches_filters` 才打印 + flush stdout。 |
+| `list_logs()` | – → exit code | 扫 `~/.hermes/logs/*.log`，每文件一行：name + size（B/KB/MB）+ 相对 mtime（"just now" / "Nm ago" / "Nh ago" / 旧的直出日期）。无目录 / 空目录给友好提示。 |
+| `_parse_since(s)` | `"30s"`/`"5m"`/`"1h"`/`"2d"` → `datetime` | 正则 `^(\d+)\s*([smhd])$`，配合 `timedelta` 算 cutoff = `now - delta`。无效输入返 `None` 让 caller 决定如何报错。 |
+| `_parse_line_timestamp(line)` | str → `Optional[datetime]` | `^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})` 匹配；无时间戳返 `None`（**不让 since 过滤误杀**——无法判定就放行）。 |
+| `_extract_level(line)` | str → `Optional[str]` | ` (DEBUG\|INFO\|WARNING\|ERROR\|CRITICAL) ` 子串匹配。 |
+| `_extract_logger_name(line)` | str → `Optional[str]` | level 后可选 `[sess_*]` tag，再下一个非空白 token 到 `:` 之前——既支持带 session tag 的行，也支持不带的。 |
+| `_line_matches_component(line, prefixes)` | (str, prefixes) → bool | logger name `startswith(tuple(prefixes))`。 |
+| `_matches_filters(line, *, min_level, session_filter, since, component_prefixes)` | str + 4 个 optional filter → bool | 四谓词依次跑：`since` → `level >= threshold` → `session_filter in line`（子串）→ component prefix。**任一不匹配返 False**；某谓词无法判定（无时间戳 / 无 level）则跳过该谓词。 |
+
+**CLI 接入**（`hermes_cli/main.py` 的 `cmd_logs`）：thin delegate，特判 `name="list"` → `list_logs()`，其它把所有 flag 透传给 `tail_log()`。`--since 30m -f` 可叠用——header 显示 cutoff，follow 阶段同样过滤新行。
 
 依赖项：
-- `hermes_constants.get_hermes_home()`（已移）
-- `hermes_logging.COMPONENT_PREFIXES`（dict 映射 logger 名前缀 → 组件名，phalanx 现有 `hermes_logging.py` 检查是否已包含；缺的话 wave 5 顺手补）
+- `hermes_constants.get_hermes_home()` / `display_hermes_home()`（已移）
+- `hermes_logging.COMPONENT_PREFIXES`（已存在；phalanx 默认五桶：`gateway` / `agent` / `tools` / `cli` / `cron`）
 
 ## 6. Stub 模式
 
