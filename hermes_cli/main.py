@@ -132,6 +132,31 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cfg_get.set_defaults(func=cmd_config_get)
     p_cfg.set_defaults(func=cmd_config_help)
 
+    # model ------------------------------------------------------------
+    p_model = sub.add_parser("model", help="inspect model metadata / context windows")
+    p_model_sub = p_model.add_subparsers(dest="model_cmd", metavar="<subcmd>")
+    p_model_list = p_model_sub.add_parser("list", help="list known model entries")
+    p_model_list.set_defaults(func=cmd_model_list)
+    p_model_info = p_model_sub.add_parser("info", help="show context window / pricing for one model")
+    p_model_info.add_argument("name", help="model name (e.g. gpt-4o-mini, qwen2.5:1.5b)")
+    p_model_info.add_argument("--base-url", default=None,
+                              help="endpoint base_url (overrides config)")
+    p_model_info.set_defaults(func=cmd_model_info)
+    p_model.set_defaults(func=cmd_model_help)
+
+    # pricing ----------------------------------------------------------
+    p_price = sub.add_parser("pricing", help="rough pricing utilities")
+    p_price_sub = p_price.add_subparsers(dest="pricing_cmd", metavar="<subcmd>")
+    p_price_est = p_price_sub.add_parser("estimate", help="estimate USD cost for a token usage")
+    p_price_est.add_argument("--model", required=True, help="model name")
+    p_price_est.add_argument("--input-tokens", type=int, default=0)
+    p_price_est.add_argument("--output-tokens", type=int, default=0)
+    p_price_est.add_argument("--cache-read-tokens", type=int, default=0)
+    p_price_est.add_argument("--cache-write-tokens", type=int, default=0)
+    p_price_est.add_argument("--base-url", default=None)
+    p_price_est.set_defaults(func=cmd_pricing_estimate)
+    p_price.set_defaults(func=cmd_pricing_help)
+
     # version ----------------------------------------------------------
     p_ver = sub.add_parser("version", help="print phalanx version")
     p_ver.set_defaults(func=cmd_version)
@@ -404,6 +429,125 @@ def cmd_tools_dry_run(args: argparse.Namespace) -> int:
         ensure_ascii=False, indent=2,
     ))
     return 1
+
+
+def cmd_model_help(args: argparse.Namespace) -> int:
+    print("usage: hermes model <list|info> ...")
+    return 0
+
+
+def cmd_model_list(args: argparse.Namespace) -> int:
+    """Dump the curated DEFAULT_CONTEXT_LENGTHS table.
+
+    These are static fallbacks used when live probes (OpenRouter API,
+    endpoint /models, Ollama /api/tags) all fail.  Sorted by descending
+    context length so the most capable models surface first.
+    """
+    from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
+    rows = sorted(
+        DEFAULT_CONTEXT_LENGTHS.items(), key=lambda kv: (-kv[1], kv[0])
+    )
+    name_w = max(len(name) for name, _ in rows)
+    print(f"{'model':<{name_w}}  {'ctx':>10}")
+    print(f"{'-' * name_w}  {'-' * 10}")
+    for name, ctx in rows:
+        print(f"{name:<{name_w}}  {ctx:>10,}")
+    print(f"\n{len(rows)} entries")
+    return 0
+
+
+def cmd_model_info(args: argparse.Namespace) -> int:
+    """Show context window + (best-effort) pricing for one model name.
+
+    For the context length we run get_model_context_length, which checks
+    cache → live endpoint metadata → DEFAULT_CONTEXT_LENGTHS substring
+    match → safe fallback.  For pricing we only consult the cached
+    OpenRouter / endpoint metadata (no API call to avoid surprising
+    network usage from a `model info` invocation).
+    """
+    from agent.model_metadata import (
+        get_model_context_length,
+        is_local_endpoint,
+        DEFAULT_CONTEXT_LENGTHS,
+    )
+    from agent.usage_pricing import has_known_pricing, get_pricing_entry
+
+    cfg = load_config()
+    base_url = (
+        args.base_url
+        or os.environ.get("OPENAI_BASE_URL")
+        or cfg_get(cfg, "model", "base_url", default="")
+        or ""
+    )
+    api_key = os.environ.get("OPENAI_API_KEY") or ""
+
+    print(f"model:    {args.name}")
+    print(f"base_url: {base_url or '<unset>'}")
+    print(f"local:    {is_local_endpoint(base_url) if base_url else 'unknown'}")
+
+    try:
+        ctx = get_model_context_length(args.name, base_url=base_url, api_key=api_key)
+        print(f"context:  {ctx:,} tokens")
+    except Exception as exc:
+        print(f"context:  <probe failed: {exc}>")
+
+    fallback = None
+    for prefix, value in DEFAULT_CONTEXT_LENGTHS.items():
+        if prefix.lower() in args.name.lower():
+            fallback = (prefix, value)
+            break
+    if fallback:
+        print(f"fallback: '{fallback[0]}' → {fallback[1]:,} (DEFAULT_CONTEXT_LENGTHS substring match)")
+
+    if has_known_pricing(args.name, base_url=base_url, api_key=api_key):
+        entry = get_pricing_entry(args.name, base_url=base_url, api_key=api_key)
+        if entry:
+            print(f"pricing:  input ${entry.input_cost_per_million}/1M  output ${entry.output_cost_per_million}/1M  (source: {entry.source})")
+    else:
+        print("pricing:  unknown")
+    return 0
+
+
+def cmd_pricing_help(args: argparse.Namespace) -> int:
+    print("usage: hermes pricing <estimate> ...")
+    return 0
+
+
+def cmd_pricing_estimate(args: argparse.Namespace) -> int:
+    """Estimate USD cost for a hypothetical token usage."""
+    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+
+    cfg = load_config()
+    base_url = (
+        args.base_url
+        or os.environ.get("OPENAI_BASE_URL")
+        or cfg_get(cfg, "model", "base_url", default="")
+        or ""
+    )
+    api_key = os.environ.get("OPENAI_API_KEY") or ""
+
+    usage = CanonicalUsage(
+        input_tokens=args.input_tokens,
+        output_tokens=args.output_tokens,
+        cache_read_tokens=args.cache_read_tokens,
+        cache_write_tokens=args.cache_write_tokens,
+    )
+    result = estimate_usage_cost(args.model, usage, base_url=base_url, api_key=api_key)
+
+    print(f"model:    {args.model}")
+    print(f"input:    {usage.input_tokens:>10,} tokens")
+    print(f"output:   {usage.output_tokens:>10,} tokens")
+    if usage.cache_read_tokens:
+        print(f"cache-rd: {usage.cache_read_tokens:>10,} tokens")
+    if usage.cache_write_tokens:
+        print(f"cache-wr: {usage.cache_write_tokens:>10,} tokens")
+    print(f"status:   {result.status}")
+    print(f"source:   {result.source}")
+    print(f"cost:     {result.label}")
+    if result.notes:
+        for note in result.notes:
+            print(f"          note: {note}")
+    return 0
 
 
 def cmd_config_help(args: argparse.Namespace) -> int:
