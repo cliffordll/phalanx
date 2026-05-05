@@ -29,7 +29,8 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,101 @@ def _should_parallelize_tool_batch(tool_calls) -> bool:
     return all(name in _PARALLEL_SAFE_TOOLS for name in tool_names)
 
 
+# ── Streaming accumulator ───────────────────────────────────────────────
+# Accumulate ChatCompletion stream chunks into a non-streaming-shaped
+# response object so the rest of run_conversation can stay unchanged.
+# Each chunk's text delta is forwarded to *callback* live, but we still
+# need a complete object at the end to extract tool_calls / finish_reason
+# and append the assistant message to the history.
+
+def _accumulate_stream(stream, callback: Callable[[str], None]) -> Any:
+    """Drain a ChatCompletion stream into a non-streaming-shaped object.
+
+    OpenAI streams emit chunks where each chunk's ``choices[0].delta``
+    has a slice of ``content`` and/or a slice of one or more
+    ``tool_calls``.  Tool-call slices are indexed: a single tool call
+    arrives as multiple chunks where ``id`` shows up first, then
+    ``function.name``, then ``function.arguments`` typed out token by
+    token.  We rebuild the full assistant message by indexing on
+    ``tc_delta.index`` and concatenating the per-field strings.
+
+    Returns a ``SimpleNamespace`` that quacks like
+    ``client.chat.completions.create(stream=False)`` for the attribute
+    accesses run_conversation actually performs:
+    ``response.choices[0].message.{content, tool_calls, role}`` plus
+    ``response.choices[0].finish_reason``.
+    """
+    content_parts: list[str] = []
+    tool_calls_acc: dict[int, dict[str, Any]] = {}
+    finish_reason: Optional[str] = None
+
+    for chunk in stream:
+        choices = getattr(chunk, "choices", None) or []
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            continue
+
+        delta_text = getattr(delta, "content", None)
+        if delta_text:
+            content_parts.append(delta_text)
+            try:
+                callback(delta_text)
+            except Exception:
+                logger.exception("stream callback failed; continuing accumulation")
+
+        tc_deltas = getattr(delta, "tool_calls", None) or []
+        for tc_delta in tc_deltas:
+            idx = getattr(tc_delta, "index", None)
+            if idx is None:
+                idx = len(tool_calls_acc)
+            slot = tool_calls_acc.setdefault(
+                idx, {"id": None, "name": "", "arguments_parts": []}
+            )
+            tc_id = getattr(tc_delta, "id", None)
+            if tc_id:
+                slot["id"] = tc_id
+            fn = getattr(tc_delta, "function", None)
+            if fn is not None:
+                fn_name = getattr(fn, "name", None)
+                if fn_name:
+                    slot["name"] = fn_name
+                fn_args = getattr(fn, "arguments", None)
+                if fn_args:
+                    slot["arguments_parts"].append(fn_args)
+
+        choice_finish = getattr(choice, "finish_reason", None)
+        if choice_finish:
+            finish_reason = choice_finish
+
+    content = "".join(content_parts) or None
+    if tool_calls_acc:
+        tool_calls = [
+            SimpleNamespace(
+                id=slot["id"],
+                type="function",
+                function=SimpleNamespace(
+                    name=slot["name"],
+                    arguments="".join(slot["arguments_parts"]) or "{}",
+                ),
+            )
+            for _idx, slot in sorted(tool_calls_acc.items())
+        ]
+    else:
+        tool_calls = None
+
+    message = SimpleNamespace(
+        role="assistant",
+        content=content,
+        tool_calls=tool_calls,
+    )
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
+    )
+
+
 # ── Tool registry plumbing ──────────────────────────────────────────────
 # Phase 2.1.4 will provide tools.registry.  Until then ``_load_tool_registry``
 # returns None and the agent runs in tool-less mode (still a valid loop).
@@ -302,6 +398,10 @@ class AIAgent:
         self._current_task_id: Optional[str] = None
         self._api_call_count = 0
         self._interrupt_requested = False
+        # Streaming callback — set by run_conversation when the caller
+        # provides one; consumed by _call_chat_completions to decide
+        # streaming vs non-streaming.
+        self._stream_callback: Optional[Callable[[str], None]] = None
 
         # Resolved tool registry (None means "no tools available").
         self._tool_registry = _load_tool_registry()
@@ -666,6 +766,13 @@ class AIAgent:
     ) -> Any:
         """Invoke chat.completions.create with retries on retryable errors.
 
+        When ``self._stream_callback`` is set, the SDK is asked to stream and
+        the resulting chunks are accumulated into a non-streaming-shaped
+        object (``response.choices[0].message.content`` / ``.tool_calls`` /
+        ``.finish_reason``) so the rest of ``run_conversation`` keeps working
+        unchanged.  Each text delta is forwarded to the callback live so a
+        TTY / TTS consumer can show progress before the full reply lands.
+
         Retries are gated by ``self.iteration_budget.remaining`` so an
         agent stuck in retry loops cannot exceed its budget.
         """
@@ -680,12 +787,17 @@ class AIAgent:
         if self.max_tokens is not None:
             api_kwargs["max_tokens"] = self.max_tokens
 
+        stream_callback: Optional[Callable[[str], None]] = self._stream_callback
+
         attempt = 0
         last_exc: Optional[Exception] = None
         while True:
             attempt += 1
             try:
-                return client.chat.completions.create(**api_kwargs)
+                if stream_callback is None:
+                    return client.chat.completions.create(**api_kwargs)
+                stream = client.chat.completions.create(stream=True, **api_kwargs)
+                return _accumulate_stream(stream, stream_callback)
             except Exception as exc:
                 last_exc = exc
                 classified = _classify_error(exc, model=self.model)
@@ -710,7 +822,7 @@ class AIAgent:
         system_message: Optional[str] = None,
         conversation_history: Optional[List[Dict[str, Any]]] = None,
         task_id: Optional[str] = None,
-        stream_callback: Optional[callable] = None,  # accepted but unused in Phase 1
+        stream_callback: Optional[Callable[[str], None]] = None,
         persist_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run a full tool-calling loop until the model returns no tool_calls.
@@ -721,8 +833,13 @@ class AIAgent:
                 ``self.ephemeral_system_prompt`` then a generic default.
             conversation_history: Prior messages to seed the conversation.
             task_id: Caller-supplied task id (auto-generated if missing).
-            stream_callback: Accepted for forward-compat; ignored in Phase 1
-                (streaming arrives in Phase 4).
+            stream_callback: When provided, every text delta from the
+                model is passed to this callable as it arrives.  The
+                final response is still returned in full via the result
+                dict.  See ``_accumulate_stream`` for the chunk-rebuild
+                semantics (tool_calls are reassembled from index-keyed
+                deltas).  When None, the SDK is called in non-streaming
+                mode (single round-trip).
             persist_user_message: Accepted for forward-compat; ignored.
 
         Returns:
@@ -733,6 +850,7 @@ class AIAgent:
         self.iteration_budget = IterationBudget(self.max_iterations)
         self._interrupt_requested = False
         self._current_task_id = task_id or str(uuid.uuid4())
+        self._stream_callback = stream_callback
 
         _set_session_log_context(self.session_id)
 
@@ -864,7 +982,7 @@ class AIAgent:
 
     # ── convenience entry ───────────────────────────────────────────
 
-    def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+    def chat(self, message: str, stream_callback: Optional[Callable[[str], None]] = None) -> str:
         """Send a single message and return the model's final text reply.
 
         Thin wrapper around ``run_conversation`` for callers that only

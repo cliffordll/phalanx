@@ -188,3 +188,135 @@ def test_oneshot_dump_tools_and_messages_independent(stub_openai, capsys):
     tools_idx = captured.err.find("--- tools ---")
     msgs_idx = captured.err.find("--- messages ---")
     assert tools_idx >= 0 and msgs_idx > tools_idx
+
+
+# ── §2.4 wave 1: streaming + provider CLI ────────────────────────────
+
+
+def _make_stream_chunk(*, content_delta=None, tool_call_delta=None, finish_reason=None):
+    """Build one ChatCompletionChunk-like object for _accumulate_stream tests."""
+    from types import SimpleNamespace
+    delta_kwargs: dict = {"content": content_delta, "tool_calls": None}
+    if tool_call_delta is not None:
+        fn = SimpleNamespace(
+            name=tool_call_delta.get("name"),
+            arguments=tool_call_delta.get("arguments"),
+        )
+        tc = SimpleNamespace(
+            index=tool_call_delta.get("index", 0),
+            id=tool_call_delta.get("id"),
+            function=fn,
+        )
+        delta_kwargs["tool_calls"] = [tc]
+    delta = SimpleNamespace(**delta_kwargs)
+    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice])
+
+
+def test_accumulate_stream_text_deltas_and_callback():
+    from run_agent import _accumulate_stream
+    chunks = [
+        _make_stream_chunk(content_delta="Hello"),
+        _make_stream_chunk(content_delta=" world"),
+        _make_stream_chunk(content_delta="!", finish_reason="stop"),
+    ]
+    deltas: list = []
+    response = _accumulate_stream(iter(chunks), deltas.append)
+    assert deltas == ["Hello", " world", "!"]
+    msg = response.choices[0].message
+    assert msg.content == "Hello world!"
+    assert msg.tool_calls is None
+    assert response.choices[0].finish_reason == "stop"
+
+
+def test_accumulate_stream_rebuilds_tool_calls():
+    """Tool-call slices arrive across chunks: id, name, then args byte-by-byte."""
+    from run_agent import _accumulate_stream
+    chunks = [
+        _make_stream_chunk(tool_call_delta={"index": 0, "id": "call_1"}),
+        _make_stream_chunk(tool_call_delta={"index": 0, "name": "echo"}),
+        _make_stream_chunk(tool_call_delta={"index": 0, "arguments": '{"text"'}),
+        _make_stream_chunk(tool_call_delta={"index": 0, "arguments": ': "hi"}'}),
+        _make_stream_chunk(finish_reason="tool_calls"),
+    ]
+    response = _accumulate_stream(iter(chunks), lambda s: None)
+    msg = response.choices[0].message
+    assert msg.content is None
+    assert len(msg.tool_calls) == 1
+    tc = msg.tool_calls[0]
+    assert tc.id == "call_1"
+    assert tc.function.name == "echo"
+    assert tc.function.arguments == '{"text": "hi"}'
+    assert response.choices[0].finish_reason == "tool_calls"
+
+
+def test_accumulate_stream_callback_failure_does_not_break_run(caplog):
+    """If the user's stream_callback raises, accumulation must continue."""
+    from run_agent import _accumulate_stream
+    chunks = [
+        _make_stream_chunk(content_delta="A"),
+        _make_stream_chunk(content_delta="B", finish_reason="stop"),
+    ]
+
+    def bad_callback(_d):
+        raise RuntimeError("ui crashed")
+
+    response = _accumulate_stream(iter(chunks), bad_callback)
+    assert response.choices[0].message.content == "AB"
+
+
+def test_provider_list_shows_active_openai_compatible(stub_openai, capsys):
+    rc = cli_main([
+        "--model", "gpt-test", "--base-url", "https://x/v1",
+        "provider", "list",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "openai-compatible" in captured.out
+    assert "[active]" in captured.out
+    assert "anthropic" in captured.out
+    assert "not yet ported" in captured.out
+
+
+def test_provider_test_pings_and_reports_ok(stub_openai, capsys):
+    stub_openai([make_text_response("pong")])
+    rc = cli_main([
+        "--model", "gpt-test", "--api-key", "sk-x", "--base-url", "https://x/v1",
+        "provider", "test",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "OK" in captured.out
+    assert "reply:" in captured.out and "pong" in captured.out
+    assert "latency:" in captured.out
+
+
+def test_provider_test_unknown_provider_rejects(monkeypatch, capsys):
+    monkeypatch.setenv("PHALANX_MODEL", "gpt-test")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    rc = cli_main(["provider", "test", "anthropic"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "not yet wired up" in captured.err
+
+
+def test_model_switch_writes_config(monkeypatch, tmp_path, capsys):
+    """`hermes model switch X` rewrites model.default in ~/.phalanx/config.yaml."""
+    monkeypatch.setenv("PHALANX_HOME", str(tmp_path))
+    rc = cli_main(["model", "switch", "qwen2.5:1.5b"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "qwen2.5:1.5b" in captured.out
+
+    # Verify the file actually exists with the right content.
+    cfg_path = tmp_path / "config.yaml"
+    assert cfg_path.exists()
+    import yaml
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert cfg["model"]["default"] == "qwen2.5:1.5b"
+
+    # Switch again to a different name; previous → new arrow shows up.
+    rc = cli_main(["model", "switch", "claude-3-5-sonnet"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "qwen2.5:1.5b → claude-3-5-sonnet" in captured.out

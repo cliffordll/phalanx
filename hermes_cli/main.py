@@ -92,6 +92,11 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="after replying, print the full messages array as JSON to stderr")
     p_one.add_argument("--dump-tools", action="store_true",
                        help="after replying, print the tools schema array as JSON to stderr")
+    p_stream = p_one.add_mutually_exclusive_group()
+    p_stream.add_argument("--stream", dest="stream", action="store_true", default=None,
+                          help="enable streaming (text deltas printed live to stdout)")
+    p_stream.add_argument("--no-stream", dest="stream", action="store_false",
+                          help="disable streaming (single round-trip; default)")
     p_one.set_defaults(func=cmd_oneshot)
 
     # chat -------------------------------------------------------------
@@ -160,7 +165,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_model_info.add_argument("--base-url", default=None,
                               help="endpoint base_url (overrides config)")
     p_model_info.set_defaults(func=cmd_model_info)
+    p_model_switch = p_model_sub.add_parser("switch", help="set the default model (writes ~/.phalanx/config.yaml)")
+    p_model_switch.add_argument("name", help="model name to use as the new default")
+    p_model_switch.set_defaults(func=cmd_model_switch)
     p_model.set_defaults(func=cmd_model_help)
+
+    # provider ---------------------------------------------------------
+    p_prov = sub.add_parser("provider", help="inspect / verify configured providers")
+    p_prov_sub = p_prov.add_subparsers(dest="provider_cmd", metavar="<subcmd>")
+    p_prov_list = p_prov_sub.add_parser("list", help="list adapters phalanx currently knows about")
+    p_prov_list.set_defaults(func=cmd_provider_list)
+    p_prov_test = p_prov_sub.add_parser("test", help="send a tiny ping to verify connectivity")
+    p_prov_test.add_argument("name", nargs="?", default="openai-compatible",
+                             help="provider name (default: openai-compatible)")
+    p_prov_test.set_defaults(func=cmd_provider_test)
+    p_prov.set_defaults(func=cmd_provider_help)
 
     # pricing ----------------------------------------------------------
     p_price = sub.add_parser("pricing", help="rough pricing utilities")
@@ -272,11 +291,25 @@ def cmd_oneshot(args: argparse.Namespace) -> int:
         max_tokens=args.max_tokens,
         system=args.system,
     )
+    stream_callback = None
+    if getattr(args, "stream", None):
+        # --stream: pipe each text delta to stdout as it arrives.
+        # The full final_response is still printed below, but for
+        # tool-only turns the deltas may be empty (model went straight
+        # to a tool_call) — that's expected.
+        def stream_callback(delta: str) -> None:
+            sys.stdout.write(delta)
+            sys.stdout.flush()
     try:
-        result = agent.run_conversation(msg)
+        result = agent.run_conversation(msg, stream_callback=stream_callback)
     finally:
         agent.close()
-    print(result.get("final_response", ""))
+    if stream_callback is not None:
+        # The stream already painted text to stdout; emit a newline so
+        # the prompt doesn't collide with the next shell line.
+        sys.stdout.write("\n")
+    else:
+        print(result.get("final_response", ""))
     if _Flags.debug:
         sys.stderr.write(
             f"\n[done] turns={result['api_calls']} stop={result['stop_reason']} "
@@ -564,6 +597,124 @@ def cmd_model_info(args: argparse.Namespace) -> int:
             print(f"pricing:  input ${entry.input_cost_per_million}/1M  output ${entry.output_cost_per_million}/1M  (source: {entry.source})")
     else:
         print("pricing:  unknown")
+    return 0
+
+
+def cmd_model_switch(args: argparse.Namespace) -> int:
+    """Persist a new default model to ~/.phalanx/config.yaml.
+
+    Reads the existing config (if any), overwrites ``model.default``,
+    and atomically rewrites the file.  This is the one CLI command that
+    *writes* config — kept narrow on purpose so it can't accidentally
+    clobber unrelated keys.
+    """
+    from hermes_cli.config import save_config
+    cfg = load_config() or {}
+    model_section = cfg.get("model")
+    if not isinstance(model_section, dict):
+        model_section = {}
+    previous = model_section.get("default")
+    model_section["default"] = args.name
+    cfg["model"] = model_section
+    save_config(cfg)
+    if previous and previous != args.name:
+        print(f"model.default: {previous} → {args.name}")
+    else:
+        print(f"model.default: {args.name}")
+    return 0
+
+
+def cmd_provider_help(args: argparse.Namespace) -> int:
+    print("usage: hermes provider <list|test> ...")
+    return 0
+
+
+def cmd_provider_list(args: argparse.Namespace) -> int:
+    """List the adapters phalanx currently knows about.
+
+    Phase 2.4 wave 1 has only the OpenAI-compatible path wired up
+    (which serves OpenAI proper, Ollama, vLLM, LM Studio, plus any
+    drop-in via base_url override).  Anthropic / Bedrock / Codex /
+    Gemini adapters land in wave 2 on demand.
+    """
+    cfg = load_config()
+    base_url = (
+        os.environ.get("OPENAI_BASE_URL")
+        or cfg_get(cfg, "model", "base_url", default="")
+        or "<unset>"
+    )
+    print("adapters:")
+    print(f"  openai-compatible    base_url={base_url}    [active]")
+    print("  anthropic            (not yet ported — §2.4 wave 2)")
+    print("  bedrock              (not yet ported)")
+    print("  codex                (not yet ported)")
+    print("  gemini               (not yet ported)")
+    return 0
+
+
+def cmd_provider_test(args: argparse.Namespace) -> int:
+    """Send a tiny ping through the active provider to verify connectivity.
+
+    Builds a one-off AIAgent (no tools, max_iterations=1, no streaming)
+    and runs a single-turn conversation with a "ping" message.  Reports
+    pass/fail with the round-trip latency.
+    """
+    if args.name != "openai-compatible":
+        sys.stderr.write(
+            f"error: provider {args.name!r} is not yet wired up. "
+            "Only 'openai-compatible' is active in this build.\n"
+        )
+        return 2
+
+    from run_agent import AIAgent
+    cfg = load_config()
+    model = (
+        _Flags.model
+        or os.environ.get("PHALANX_MODEL")
+        or os.environ.get("OPENAI_MODEL")
+        or cfg_get(cfg, "model", "default", default="")
+        or ""
+    )
+    base_url = (
+        _Flags.base_url
+        or os.environ.get("OPENAI_BASE_URL")
+        or cfg_get(cfg, "model", "base_url", default="")
+        or ""
+    )
+    api_key = (
+        _Flags.api_key
+        or os.environ.get("OPENAI_API_KEY")
+        or ""
+    )
+    if not model:
+        sys.stderr.write("error: no model configured (set --model, PHALANX_MODEL, or model.default)\n")
+        return 2
+
+    print(f"provider: {args.name}")
+    print(f"model:    {model}")
+    print(f"base_url: {base_url or '<unset>'}")
+    agent = AIAgent(
+        base_url=base_url, api_key=api_key, model=model,
+        max_iterations=1, quiet_mode=True,
+    )
+    import time as _t
+    t0 = _t.perf_counter()
+    try:
+        result = agent.run_conversation("ping — reply with the single word 'pong'")
+    except Exception as exc:
+        elapsed = _t.perf_counter() - t0
+        sys.stderr.write(f"FAIL ({elapsed*1000:.0f} ms): {type(exc).__name__}: {exc}\n")
+        return 1
+    finally:
+        agent.close()
+    elapsed = _t.perf_counter() - t0
+    reply = (result.get("final_response") or "").strip()
+    if not reply:
+        sys.stderr.write(f"FAIL ({elapsed*1000:.0f} ms): provider returned an empty reply\n")
+        return 1
+    print(f"reply:    {reply[:80]}{'...' if len(reply) > 80 else ''}")
+    print(f"latency:  {elapsed*1000:.0f} ms")
+    print("OK")
     return 0
 
 
