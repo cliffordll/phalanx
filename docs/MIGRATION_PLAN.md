@@ -408,9 +408,9 @@ python -m hermes_cli                                       # 默认进入 REPL
 | `agent/*` 之间相互依赖（如 `prompt_builder` 引用 `model_metadata` 的常量） | Phase 3 一次性把这几个文件按"最小可用子集"一起裁剪 |
 | 多 provider 分支删干净后，未来加回来需重新对照 hermes 上游 | 在 phalanx 内保留 `docs/HERMES_UPSTREAM_MAP.md` 记录"哪些行号属于哪个 provider"，方便回填 |
 | hermes 上游持续演进，phalanx 跟不上 | 因为标识符全部保持原名，可用 `git diff` 对照 hermes 仓库 cherry-pick；建议每月做一次同步 |
-| `~/.hermes/` 目录与系统中已有 hermes 安装冲突 | 测试时设环境变量 `HERMES_HOME=$(pwd)/.phalanx-home` 隔离；CLI `doctor` 子命令打印当前生效路径 |
+| `~/.phalanx/` 目录与系统中已有 hermes 安装冲突 | 已采用方案 B 完全隔离 env 变量（`PHALANX_HOME` / `PHALANX_TIMEZONE` / `PHALANX_OPTIONAL_SKILLS`）；hermes 的 `HERMES_HOME` 不再被 phalanx 识别，二者环境变量互不干扰。CLI `doctor` 子命令打印当前生效路径以便核对 |
 | Windows 路径 / PowerShell 兼容（当前环境） | Phase 1 起就在 Windows 上跑 CLI 测试，不要拖到 Phase 6 |
-| CLI debug 输出过多影响主流程性能/可读 | `--debug` 仅写 stderr 或单独 `~/.hermes/logs/debug.log`；默认 stdout 仍然干净 |
+| CLI debug 输出过多影响主流程性能/可读 | `--debug` 仅写 stderr 或单独 `~/.phalanx/logs/debug.log`；默认 stdout 仍然干净 |
 
 ---
 
@@ -421,7 +421,7 @@ python -m hermes_cli                                       # 默认进入 REPL
 3. **CLI 子命令同步追加**：每加一个底层模块，必须在同一 PR 里给 CLI 加对应的 debug 子命令。没有 CLI 入口的功能视为"未交付"。
 4. **注释裁剪**：内部 issue 编号 / 事故引用可删；公共算法说明保留。
 5. **License**：`hermes-agent` 是 MIT。在 phalanx 根目录放 `LICENSE`，顶部保留原作者 (Nous Research) 的版权声明 + 你的修改条款。
-6. **`HERMES_HOME` 环境变量**：保留原名，便于直接复用 hermes 现有用户配置。
+6. **环境变量改名为 `PHALANX_*`（方案 B）**：`HERMES_HOME` → `PHALANX_HOME`、`HERMES_TIMEZONE` → `PHALANX_TIMEZONE`、`HERMES_OPTIONAL_SKILLS` → `PHALANX_OPTIONAL_SKILLS`。原因：与系统中已装的 hermes-agent 完全隔离，避免共用同一 env 变量时数据互相污染。**函数名 `get_hermes_home` 等保持不变**（标识符约束）；只改 env 变量字面量与默认路径 `~/.hermes` → `~/.phalanx`。从 hermes 上游 cherry-pick 时，每批做一次 `sed -i 's/HERMES_HOME/PHALANX_HOME/g'`（含其他 `HERMES_*` env 变量同步处理）。
 7. **不新增"包名前缀"**：不要把 `agent/` 包成 `phalanx/agent/`——保持原顶层布局，让 `from agent.retry_utils import jittered_backoff` 这种 import 在 phalanx 内仍然有效。
 
 ---
