@@ -382,3 +382,165 @@ def test_concurrent_appends_serialize(tmp_path):
         assert db.get_session("sess_cc")["message_count"] == 40
     finally:
         db.close()
+
+
+# ── Resume helpers (wave 3) ──────────────────────────────────────────────
+
+
+def test_resolve_session_id_exact_match(stub_session_db):
+    stub_session_db.create_session("sess_xyz", source="cli")
+    assert stub_session_db.resolve_session_id("sess_xyz") == "sess_xyz"
+
+
+def test_resolve_session_id_unique_prefix(stub_session_db):
+    stub_session_db.create_session("sess_aaaa", source="cli")
+    stub_session_db.create_session("sess_bbbb", source="cli")
+    assert stub_session_db.resolve_session_id("sess_aa") == "sess_aaaa"
+
+
+def test_resolve_session_id_ambiguous_prefix_returns_none(stub_session_db):
+    stub_session_db.create_session("sess_aaaa", source="cli")
+    stub_session_db.create_session("sess_aabb", source="cli")
+    assert stub_session_db.resolve_session_id("sess_aa") is None
+
+
+def test_resolve_session_id_no_match_returns_none(stub_session_db):
+    stub_session_db.create_session("sess_zzz", source="cli")
+    assert stub_session_db.resolve_session_id("missing") is None
+
+
+def test_resolve_session_id_escapes_like_metacharacters(stub_session_db):
+    """``%`` and ``_`` in the input must not match arbitrary characters."""
+    stub_session_db.create_session("sess_real", source="cli")
+    stub_session_db.create_session("sess_other", source="cli")
+    # If the LIKE escape is broken, ``s_ss%`` would match either id.
+    assert stub_session_db.resolve_session_id("s%") is None
+
+
+def test_resolve_resume_session_id_returns_self_when_messages_present(
+    stub_session_db,
+):
+    stub_session_db.create_session("sess_self", source="cli")
+    stub_session_db.append_message("sess_self", "user", content="hi")
+    assert (
+        stub_session_db.resolve_resume_session_id("sess_self") == "sess_self"
+    )
+
+
+def test_resolve_resume_session_id_walks_to_compression_descendant(
+    stub_session_db,
+):
+    """Empty parent compresses into a child that holds the messages."""
+    stub_session_db.create_session("sess_parent", source="cli")
+    stub_session_db.end_session("sess_parent", end_reason="compression")
+    stub_session_db.create_session(
+        "sess_child", source="cli", parent_session_id="sess_parent",
+    )
+    stub_session_db.append_message("sess_child", "user", content="continued")
+    assert (
+        stub_session_db.resolve_resume_session_id("sess_parent") == "sess_child"
+    )
+
+
+def test_resolve_resume_session_id_returns_self_when_no_descendants(
+    stub_session_db,
+):
+    stub_session_db.create_session("sess_lone", source="cli")
+    assert (
+        stub_session_db.resolve_resume_session_id("sess_lone") == "sess_lone"
+    )
+
+
+def test_get_messages_as_conversation_strips_db_metadata(stub_session_db):
+    """The replay shape is OpenAI-style: role+content (+ tool_* / reasoning)."""
+    stub_session_db.create_session("sess_rep", source="cli")
+    stub_session_db.append_message("sess_rep", "user", content="hi")
+    stub_session_db.append_message(
+        "sess_rep", "assistant",
+        content="calling echo",
+        tool_calls=[
+            {"id": "c1", "type": "function",
+             "function": {"name": "echo", "arguments": "{}"}},
+        ],
+        finish_reason="tool_calls",
+    )
+    stub_session_db.append_message(
+        "sess_rep", "tool",
+        content="echo-result",
+        tool_call_id="c1",
+        tool_name="echo",
+    )
+    msgs = stub_session_db.get_messages_as_conversation("sess_rep")
+    # No timestamp / id / token_count leaking through.
+    for m in msgs:
+        assert "timestamp" not in m
+        assert "id" not in m
+        assert "token_count" not in m
+    assert msgs[0] == {"role": "user", "content": "hi"}
+    assert msgs[1]["role"] == "assistant"
+    assert msgs[1]["content"] == "calling echo"
+    assert msgs[1]["tool_calls"][0]["function"]["name"] == "echo"
+    assert msgs[1]["finish_reason"] == "tool_calls"
+    assert msgs[2] == {
+        "role": "tool",
+        "content": "echo-result",
+        "tool_call_id": "c1",
+        "tool_name": "echo",
+    }
+
+
+def test_session_lineage_root_to_tip_orders_root_first(stub_session_db):
+    stub_session_db.create_session("root", source="cli")
+    stub_session_db.create_session("mid", source="cli", parent_session_id="root")
+    stub_session_db.create_session("tip", source="cli", parent_session_id="mid")
+    assert stub_session_db._session_lineage_root_to_tip("tip") == [
+        "root", "mid", "tip",
+    ]
+
+
+def test_session_lineage_handles_cycle_defensively(stub_session_db):
+    """A malformed cycle shouldn't loop forever."""
+    stub_session_db._conn.execute(
+        "INSERT INTO sessions (id, source, parent_session_id, started_at) "
+        "VALUES ('a', 'cli', 'b', 0), ('b', 'cli', 'a', 0)"
+    )
+    stub_session_db._conn.commit()
+    chain = stub_session_db._session_lineage_root_to_tip("a")
+    assert chain[-1] == "a"  # always lands at the requested tip
+    assert len(chain) <= 100
+
+
+def test_is_duplicate_replayed_user_message_true_at_lineage_seam():
+    """Same user prompt with no assistant progress in between → dupe."""
+    history = [
+        {"role": "user", "content": "second prompt"},
+        # No assistant turn after — child session about to replay the
+        # same user message it inherited from the parent.
+    ]
+    assert SessionDB._is_duplicate_replayed_user_message(
+        history, {"role": "user", "content": "second prompt"}
+    ) is True
+
+
+def test_is_duplicate_replayed_user_message_false_when_assistant_progressed():
+    """Real new turn — assistant produced content since last identical user."""
+    history = [
+        {"role": "user", "content": "second prompt"},
+        {"role": "assistant", "content": "reply"},
+    ]
+    assert SessionDB._is_duplicate_replayed_user_message(
+        history, {"role": "user", "content": "second prompt"}
+    ) is False
+
+
+def test_is_duplicate_replayed_user_message_false_for_different_content():
+    history = [{"role": "user", "content": "first"}]
+    assert SessionDB._is_duplicate_replayed_user_message(
+        history, {"role": "user", "content": "second"}
+    ) is False
+
+
+def test_is_duplicate_replayed_ignores_non_user_role():
+    assert SessionDB._is_duplicate_replayed_user_message(
+        [], {"role": "assistant", "content": "x"}
+    ) is False

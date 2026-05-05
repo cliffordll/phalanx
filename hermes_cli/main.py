@@ -52,6 +52,7 @@ class _Flags:
     base_url: Optional[str] = None
     api_key: Optional[str] = None
     provider: Optional[str] = None
+    resume: Optional[str] = None  # session_id or unique prefix
 
 
 # ── Argparse wiring ────────────────────────────────────────────────────
@@ -79,6 +80,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--provider", default=None,
                         choices=["openai-compatible", "anthropic", "bedrock", "codex", "gemini"],
                         help="force a specific provider (overrides base_url-based auto-detection)")
+    parser.add_argument("--resume", default=None, metavar="SESSION_ID",
+                        help="resume an existing session (full id or unique prefix); "
+                             "history is loaded from ~/.hermes/state.db")
 
     sub = parser.add_subparsers(dest="cmd", metavar="<command>")
 
@@ -239,7 +243,13 @@ def _build_agent(args: argparse.Namespace, *,
                  max_iterations: int = 90,
                  max_tokens: Optional[int] = None,
                  system: Optional[str] = None):
-    """Construct an AIAgent honoring global + subcommand flags."""
+    """Construct an AIAgent honoring global + subcommand flags.
+
+    Returns a tuple ``(agent, conversation_history)`` so callers that
+    pass the history into ``run_conversation`` don't need to re-query
+    the DB.  ``conversation_history`` is ``None`` outside the resume
+    path (the common case).
+    """
     # Lazy import — keeps `hermes version` / `hermes doctor` fast even
     # when openai SDK can't load (e.g. missing httpx variant).
     from run_agent import AIAgent
@@ -269,7 +279,44 @@ def _build_agent(args: argparse.Namespace, *,
         or os.environ.get("PHALANX_API_KEY")
     )
 
-    return AIAgent(
+    # SessionDB is constructed unconditionally so every CLI turn lands
+    # in ~/.hermes/state.db.  Without that, ``--resume`` has nothing to
+    # recover.  Failures fall back to ephemeral so a misconfigured DB
+    # path can't block the agent loop.
+    session_db = None
+    session_id: Optional[str] = None
+    history: Optional[List[Dict[str, Any]]] = None
+    try:
+        from hermes_state import SessionDB
+        session_db = SessionDB()
+    except Exception as exc:
+        logger.warning("session DB init failed; running ephemeral: %s", exc)
+        session_db = None
+
+    if _Flags.resume:
+        if session_db is None:
+            sys.stderr.write(
+                "error: --resume requires a working session DB\n"
+            )
+            sys.exit(2)
+        resolved = session_db.resolve_session_id(_Flags.resume)
+        if not resolved:
+            sys.stderr.write(
+                f"error: --resume {_Flags.resume!r}: no matching session "
+                "(or prefix is ambiguous)\n"
+            )
+            sys.exit(2)
+        # Compression chains live in §2.7 territory but the helper
+        # short-circuits cleanly when there's no chain, so it's safe to
+        # call unconditionally.
+        session_id = session_db.resolve_resume_session_id(resolved)
+        history = session_db.get_messages_as_conversation(session_id)
+        # The session was end_session'd at the close of its last
+        # run_conversation; reopen it so the upcoming end_session call
+        # records the new stop_reason instead of being silently no-op.
+        session_db.reopen_session(session_id)
+
+    agent = AIAgent(
         base_url=base_url,
         api_key=api_key,
         model=model,
@@ -279,7 +326,10 @@ def _build_agent(args: argparse.Namespace, *,
         quiet_mode=_Flags.quiet,
         ephemeral_system_prompt=system,
         provider=_Flags.provider,
+        session_db=session_db,
+        session_id=session_id,
     )
+    return agent, history
 
 
 # ── Subcommand handlers ────────────────────────────────────────────────
@@ -290,7 +340,7 @@ def cmd_oneshot(args: argparse.Namespace) -> int:
     if not msg:
         sys.stderr.write("error: oneshot requires a message\n")
         return 2
-    agent = _build_agent(
+    agent, history = _build_agent(
         args,
         max_iterations=args.max_iterations,
         max_tokens=args.max_tokens,
@@ -306,7 +356,11 @@ def cmd_oneshot(args: argparse.Namespace) -> int:
             sys.stdout.write(delta)
             sys.stdout.flush()
     try:
-        result = agent.run_conversation(msg, stream_callback=stream_callback)
+        result = agent.run_conversation(
+            msg,
+            conversation_history=history,
+            stream_callback=stream_callback,
+        )
     finally:
         agent.close()
     if stream_callback is not None:
@@ -915,6 +969,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _Flags.base_url = getattr(args, "base_url", None)
     _Flags.api_key = getattr(args, "api_key", None)
     _Flags.provider = getattr(args, "provider", None)
+    _Flags.resume = getattr(args, "resume", None)
 
     _setup_logging(_Flags.debug)
     _load_dotenv_best_effort()
