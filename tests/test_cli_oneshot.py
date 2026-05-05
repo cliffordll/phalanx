@@ -38,8 +38,10 @@ def test_doctor_passes_when_model_is_set(monkeypatch, capsys):
     assert "available" in captured.out
 
 
-def test_doctor_flags_missing_model(monkeypatch, capsys):
-    # Strip every model-source so doctor's resolution falls through.
+def test_doctor_flags_missing_model(monkeypatch, capsys, tmp_path):
+    """Point PHALANX_HOME at an empty tmp dir so the host's real
+    ~/.phalanx/config.yaml can't satisfy the model-resolution chain."""
+    monkeypatch.setenv("PHALANX_HOME", str(tmp_path))
     for var in ("PHALANX_MODEL", "OPENAI_MODEL"):
         monkeypatch.delenv(var, raising=False)
     rc = cli_main(["doctor"])

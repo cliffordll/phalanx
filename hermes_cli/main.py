@@ -57,7 +57,13 @@ class _Flags:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Construct the top-level argparse parser with all subcommands."""
+    """Construct the top-level argparse parser with all subcommands.
+
+    Mirrors upstream hermes_cli/_parser.py's flat structure: global
+    flags live on the top-level parser only; subparsers re-declare any
+    flag they happen to need.  Result: ``hermes --debug oneshot "..."``
+    works, ``hermes oneshot --debug "..."`` does not — same as upstream.
+    """
     parser = argparse.ArgumentParser(
         prog="hermes",
         description="Phalanx — minimal AI agent ported from hermes-agent",
