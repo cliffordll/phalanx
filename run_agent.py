@@ -1,0 +1,698 @@
+#!/usr/bin/env python3
+"""
+AI Agent Runner with Tool Calling — Phase 1 minimal port.
+
+This is the phalanx Phase-1 cut-down of hermes-agent's run_agent.py.
+It keeps the public entry points (``AIAgent`` class, ``run_conversation``,
+``chat``, module-level ``main``, ``IterationBudget``, ``OpenAI`` lazy
+proxy) so callers / tests written against the upstream interface work
+unchanged.  Removed (will be reintroduced in later phases):
+
+  - Multi-provider adapters (anthropic / bedrock / codex / gemini)
+  - Streaming path, prompt caching, context compression
+  - Credential pool, fallback runtime, ACP transport
+  - Tool guardrails, checkpoints, steer, skill injection
+  - Memory prefetch, trajectory persistence, surrogate sanitization
+
+Usage:
+    from run_agent import AIAgent
+    agent = AIAgent(base_url="https://api.openai.com/v1", model="gpt-4o-mini")
+    result = agent.run_conversation("Hello!")
+    print(result["final_response"])
+"""
+
+import copy
+import json
+import logging
+import os
+import sys
+import threading
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Lazy import of OpenAI SDK — see _OpenAIProxy.
+# Keeps cold-start fast and lets test code patch ``run_agent.OpenAI``.
+_OPENAI_CLS_CACHE: Optional[type] = None
+
+
+def _load_openai_cls() -> type:
+    """Import and cache ``openai.OpenAI``."""
+    global _OPENAI_CLS_CACHE
+    if _OPENAI_CLS_CACHE is None:
+        from openai import OpenAI as _cls
+        _OPENAI_CLS_CACHE = _cls
+    return _OPENAI_CLS_CACHE
+
+
+class _OpenAIProxy:
+    """Module-level proxy that looks like ``openai.OpenAI`` but imports lazily."""
+
+    __slots__ = ()
+
+    def __call__(self, *args, **kwargs):
+        return _load_openai_cls()(*args, **kwargs)
+
+    def __instancecheck__(self, obj):
+        return isinstance(obj, _load_openai_cls())
+
+    def __repr__(self):
+        return "<lazy openai.OpenAI proxy>"
+
+
+OpenAI = _OpenAIProxy()
+
+
+# ── Stdio safety wrapper ────────────────────────────────────────────────
+
+class _SafeWriter:
+    """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
+
+    When the agent runs as a daemon / Docker / piped subprocess, stdout
+    can become unavailable mid-write.  This wrapper silently swallows
+    OSError and ValueError so a print() inside an except handler can't
+    double-fault the process.
+    """
+
+    __slots__ = ("_inner",)
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+
+    def write(self, data):
+        try:
+            return self._inner.write(data)
+        except (OSError, ValueError):
+            return len(data) if isinstance(data, str) else 0
+
+    def flush(self):
+        try:
+            self._inner.flush()
+        except (OSError, ValueError):
+            pass
+
+    def fileno(self):
+        return self._inner.fileno()
+
+    def isatty(self):
+        try:
+            return self._inner.isatty()
+        except (OSError, ValueError):
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _install_safe_stdio() -> None:
+    """Wrap stdout/stderr so best-effort console output cannot crash the agent."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is not None and not isinstance(stream, _SafeWriter):
+            setattr(sys, stream_name, _SafeWriter(stream))
+
+
+# ── Iteration budget ────────────────────────────────────────────────────
+
+class IterationBudget:
+    """Thread-safe iteration counter for an agent.
+
+    Each agent gets its own ``IterationBudget`` capped at
+    ``max_iterations`` (default 90).  Subagents inherit the parent's
+    budget so tool-driven subagent fan-out can't bypass the cap.
+    """
+
+    def __init__(self, max_total: int):
+        self.max_total = max_total
+        self._used = 0
+        self._lock = threading.Lock()
+
+    def consume(self) -> bool:
+        """Try to consume one iteration.  Returns True if allowed."""
+        with self._lock:
+            if self._used >= self.max_total:
+                return False
+            self._used += 1
+            return True
+
+    def refund(self) -> None:
+        """Give back one iteration (rarely used in Phase 1)."""
+        with self._lock:
+            if self._used > 0:
+                self._used -= 1
+
+    @property
+    def used(self) -> int:
+        return self._used
+
+    @property
+    def remaining(self) -> int:
+        with self._lock:
+            return max(0, self.max_total - self._used)
+
+
+# ── Tool registry plumbing ──────────────────────────────────────────────
+# Phase 2.1.4 will provide tools.registry.  Until then ``_load_tool_registry``
+# returns None and the agent runs in tool-less mode (still a valid loop).
+
+def _load_tool_registry():
+    """Return the tools.registry module if available, else None."""
+    try:
+        from tools import registry  # type: ignore[import-not-found]
+        return registry
+    except ImportError:
+        return None
+
+
+# ── Optional integrations (best-effort lazy imports) ────────────────────
+
+def _set_session_log_context(session_id: str) -> None:
+    """Tag log records on this thread with the session id, if hermes_logging is available."""
+    try:
+        from hermes_logging import set_session_context
+        set_session_context(session_id)
+    except Exception:
+        pass
+
+
+def _classify_error(exc: Exception, *, provider: str = "", model: str = ""):
+    """Classify an API exception, falling back to a generic retryable verdict."""
+    try:
+        from agent.error_classifier import classify_api_error
+        return classify_api_error(exc, provider=provider, model=model)
+    except Exception:
+        # Minimal fallback so the loop still works without error_classifier.
+        class _Fallback:
+            retryable = True
+            should_compress = False
+            should_rotate_credential = False
+        return _Fallback()
+
+
+def _retry_delay(attempt: int) -> float:
+    """Compute a jittered backoff delay for the given attempt."""
+    try:
+        from agent.retry_utils import jittered_backoff
+        return jittered_backoff(attempt)
+    except Exception:
+        # Fallback: simple exponential backoff capped at 60s.
+        return min(2 ** max(0, attempt - 1), 60.0)
+
+
+# ── Main agent class ────────────────────────────────────────────────────
+
+class AIAgent:
+    """AI Agent with tool calling capabilities (Phase 1 minimal version).
+
+    Targets OpenAI-compatible chat completions endpoints.  Other
+    providers (anthropic, bedrock, codex) ship in Phase 4.
+    """
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @base_url.setter
+    def base_url(self, value: str) -> None:
+        self._base_url = value or ""
+
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model: str = "",
+        max_iterations: int = 90,
+        tool_delay: float = 1.0,
+        enabled_toolsets: Optional[List[str]] = None,
+        disabled_toolsets: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+        verbose_logging: bool = False,
+        quiet_mode: bool = False,
+        max_tokens: Optional[int] = None,
+        ephemeral_system_prompt: Optional[str] = None,
+        iteration_budget: Optional[IterationBudget] = None,
+    ):
+        """Initialize the AI Agent.
+
+        Phase 1 keeps a minimal parameter surface — Phases 2+ reintroduce
+        the dropped knobs (provider, providers_*, callbacks, fallback_model,
+        credential_pool, prefill_messages, …) as they become relevant.
+        """
+        _install_safe_stdio()
+
+        self.model = model
+        self.max_iterations = max_iterations
+        self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+        self.tool_delay = tool_delay
+        self.enabled_toolsets = list(enabled_toolsets) if enabled_toolsets else []
+        self.disabled_toolsets = list(disabled_toolsets) if disabled_toolsets else []
+        self.verbose_logging = verbose_logging
+        self.quiet_mode = quiet_mode
+        self.ephemeral_system_prompt = ephemeral_system_prompt
+        self.max_tokens = max_tokens
+
+        self.base_url = base_url or os.environ.get("OPENAI_BASE_URL", "")
+        self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        self.session_id = session_id or str(uuid.uuid4())
+
+        # Lazy-built OpenAI client; created on first API call.
+        self._client = None
+        self._client_lock = threading.RLock()
+
+        # Per-turn state — reset at the start of each run_conversation.
+        self._current_task_id: Optional[str] = None
+        self._api_call_count = 0
+        self._interrupt_requested = False
+
+        # Resolved tool registry (None means "no tools available").
+        self._tool_registry = _load_tool_registry()
+
+        # Cached schemas — built lazily, invalidated by switch_tools().
+        self._tool_schemas_cache: Optional[List[Dict[str, Any]]] = None
+
+    # ── small helpers ────────────────────────────────────────────────
+
+    def _safe_print(self, *args, **kwargs) -> None:
+        """print() that survives broken stdout pipes (delegates to _SafeWriter)."""
+        if self.quiet_mode and not kwargs.pop("force", False):
+            return
+        try:
+            print(*args, **kwargs)
+        except (OSError, ValueError):
+            pass
+
+    def _vprint(self, *args, **kwargs) -> None:
+        """Verbose-only print; controlled by ``verbose_logging``."""
+        if self.verbose_logging:
+            self._safe_print(*args, **kwargs)
+
+    # ── client management ────────────────────────────────────────────
+
+    def _build_client_kwargs(self) -> Dict[str, Any]:
+        """Build kwargs for ``OpenAI(...)`` from agent state."""
+        kwargs: Dict[str, Any] = {}
+        if self._api_key:
+            kwargs["api_key"] = self._api_key
+        if self._base_url:
+            kwargs["base_url"] = self._base_url
+        return kwargs
+
+    def _get_openai_client(self):
+        """Return a cached OpenAI client, building on first call."""
+        with self._client_lock:
+            if self._client is None:
+                self._client = OpenAI(**self._build_client_kwargs())
+            return self._client
+
+    def close(self) -> None:
+        """Close any cached OpenAI client.  Safe to call multiple times."""
+        with self._client_lock:
+            client = self._client
+            self._client = None
+        if client is not None:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    # ── tool plumbing ────────────────────────────────────────────────
+
+    def _resolve_tool_schemas(self) -> List[Dict[str, Any]]:
+        """Return the OpenAI-format tool schemas this agent should expose.
+
+        Reads ``tools.registry.list_schemas()`` if available (Phase 2.1.4+);
+        otherwise returns ``[]`` (tool-less mode).  Filters by
+        ``enabled_toolsets`` / ``disabled_toolsets`` when set.
+        """
+        if self._tool_schemas_cache is not None:
+            return self._tool_schemas_cache
+
+        registry = self._tool_registry
+        if registry is None:
+            self._tool_schemas_cache = []
+            return self._tool_schemas_cache
+
+        list_schemas = getattr(registry, "list_schemas", None)
+        if not callable(list_schemas):
+            self._tool_schemas_cache = []
+            return self._tool_schemas_cache
+
+        try:
+            schemas = list_schemas() or []
+        except Exception as exc:
+            logger.warning("tools.registry.list_schemas() failed: %s", exc)
+            self._tool_schemas_cache = []
+            return self._tool_schemas_cache
+
+        # toolset filtering — best-effort, not all registries expose it.
+        if self.enabled_toolsets or self.disabled_toolsets:
+            filtered = []
+            for schema in schemas:
+                toolset = (schema.get("toolset") or "").lower()
+                if self.disabled_toolsets and toolset in (t.lower() for t in self.disabled_toolsets):
+                    continue
+                if self.enabled_toolsets and toolset not in (t.lower() for t in self.enabled_toolsets):
+                    continue
+                filtered.append(schema)
+            schemas = filtered
+
+        # Strip phalanx-specific keys before passing to the OpenAI SDK.
+        # The SDK rejects unknown top-level keys on each tool entry.
+        normalized = []
+        for schema in schemas:
+            entry = {k: v for k, v in schema.items() if k in ("type", "function")}
+            if "function" in entry and "type" not in entry:
+                entry["type"] = "function"
+            normalized.append(entry)
+
+        self._tool_schemas_cache = normalized
+        return normalized
+
+    def _dispatch_tool_call(self, tool_name: str, arguments: Dict[str, Any]) -> str:
+        """Run a single tool by name, returning a string result."""
+        registry = self._tool_registry
+        if registry is None:
+            return f"[error] no tool registry loaded; cannot run {tool_name!r}"
+        dispatch = getattr(registry, "dispatch", None)
+        if not callable(dispatch):
+            return f"[error] tools.registry has no dispatch(); cannot run {tool_name!r}"
+        try:
+            return dispatch(tool_name, arguments)
+        except Exception as exc:
+            logger.exception("tool %s failed", tool_name)
+            return f"[error] tool {tool_name} raised {type(exc).__name__}: {exc}"
+
+    @staticmethod
+    def _parse_tool_arguments(raw: Any) -> Dict[str, Any]:
+        """Best-effort parse of ``tool_calls[*].function.arguments`` to a dict."""
+        if isinstance(raw, dict):
+            return raw
+        if not raw:
+            return {}
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _serialize_tool_calls(tool_calls: Any) -> List[Dict[str, Any]]:
+        """Convert OpenAI SDK tool_call objects into JSON-serializable dicts."""
+        out: List[Dict[str, Any]] = []
+        for tc in tool_calls or []:
+            tc_id = getattr(tc, "id", None) or (tc.get("id") if isinstance(tc, dict) else None)
+            fn = getattr(tc, "function", None)
+            if fn is None and isinstance(tc, dict):
+                fn = tc.get("function") or {}
+            name = getattr(fn, "name", None) if not isinstance(fn, dict) else fn.get("name")
+            args = getattr(fn, "arguments", None) if not isinstance(fn, dict) else fn.get("arguments")
+            out.append({
+                "id": tc_id or AIAgent._fallback_call_id(name or "", args or "", len(out)),
+                "type": "function",
+                "function": {"name": name or "", "arguments": args or "{}"},
+            })
+        return out
+
+    @staticmethod
+    def _fallback_call_id(fn_name: str, arguments: str, index: int) -> str:
+        """Build a deterministic call_id when the SDK didn't provide one."""
+        import hashlib
+        h = hashlib.sha1(f"{fn_name}|{arguments}|{index}".encode("utf-8")).hexdigest()
+        return f"call_{h[:24]}"
+
+    # ── API call with retry ─────────────────────────────────────────
+
+    def _call_chat_completions(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+    ) -> Any:
+        """Invoke chat.completions.create with retries on retryable errors.
+
+        Retries are gated by ``self.iteration_budget.remaining`` so an
+        agent stuck in retry loops cannot exceed its budget.
+        """
+        client = self._get_openai_client()
+
+        api_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+        }
+        if tools:
+            api_kwargs["tools"] = tools
+        if self.max_tokens is not None:
+            api_kwargs["max_tokens"] = self.max_tokens
+
+        attempt = 0
+        last_exc: Optional[Exception] = None
+        while True:
+            attempt += 1
+            try:
+                return client.chat.completions.create(**api_kwargs)
+            except Exception as exc:
+                last_exc = exc
+                classified = _classify_error(exc, model=self.model)
+                if not getattr(classified, "retryable", True):
+                    logger.warning("non-retryable API error: %s", exc)
+                    raise
+                if attempt >= 5 or self.iteration_budget.remaining == 0:
+                    logger.warning("retry budget exhausted after %d attempts: %s", attempt, exc)
+                    raise
+                delay = _retry_delay(attempt)
+                logger.info("API error (attempt %d): %s; retrying in %.1fs", attempt, exc, delay)
+                time.sleep(delay)
+
+        # Unreachable; mypy guard.
+        raise last_exc if last_exc else RuntimeError("unreachable")
+
+    # ── main conversation loop ───────────────────────────────────────
+
+    def run_conversation(
+        self,
+        user_message: str,
+        system_message: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+        task_id: Optional[str] = None,
+        stream_callback: Optional[callable] = None,  # accepted but unused in Phase 1
+        persist_user_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run a full tool-calling loop until the model returns no tool_calls.
+
+        Args:
+            user_message: The user's prompt.
+            system_message: Override for the system prompt; falls back to
+                ``self.ephemeral_system_prompt`` then a generic default.
+            conversation_history: Prior messages to seed the conversation.
+            task_id: Caller-supplied task id (auto-generated if missing).
+            stream_callback: Accepted for forward-compat; ignored in Phase 1
+                (streaming arrives in Phase 4).
+            persist_user_message: Accepted for forward-compat; ignored.
+
+        Returns:
+            ``{"final_response": str, "messages": list, "api_calls": int,
+              "stop_reason": str, "iterations_used": int}``
+        """
+        # Per-turn budget reset — matches upstream behavior.
+        self.iteration_budget = IterationBudget(self.max_iterations)
+        self._interrupt_requested = False
+        self._current_task_id = task_id or str(uuid.uuid4())
+
+        _set_session_log_context(self.session_id)
+
+        # Build initial messages list.
+        messages: List[Dict[str, Any]] = (
+            [copy.deepcopy(m) for m in conversation_history] if conversation_history else []
+        )
+
+        effective_system = (
+            system_message
+            or self.ephemeral_system_prompt
+            or "You are a helpful AI assistant with access to tools."
+        )
+        # Ensure system message is first.
+        if not messages or messages[0].get("role") != "system":
+            messages.insert(0, {"role": "system", "content": effective_system})
+        else:
+            messages[0]["content"] = effective_system
+
+        messages.append({"role": "user", "content": user_message})
+
+        tools = self._resolve_tool_schemas()
+        api_call_count = 0
+        stop_reason = "completed"
+        final_text = ""
+
+        while api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
+            if self._interrupt_requested:
+                stop_reason = "interrupted"
+                break
+
+            api_call_count += 1
+            self._api_call_count = api_call_count
+            if not self.iteration_budget.consume():
+                stop_reason = "budget_exhausted"
+                break
+
+            self._vprint(f"[loop] turn {api_call_count}: calling {self.model}")
+
+            try:
+                response = self._call_chat_completions(messages, tools)
+            except Exception as exc:
+                stop_reason = f"api_error:{type(exc).__name__}"
+                logger.error("API call failed permanently: %s", exc)
+                final_text = f"[error] API call failed: {exc}"
+                break
+
+            choice = response.choices[0] if getattr(response, "choices", None) else None
+            if choice is None:
+                stop_reason = "empty_response"
+                break
+
+            assistant_msg = choice.message
+            content = getattr(assistant_msg, "content", None) or ""
+            raw_tool_calls = getattr(assistant_msg, "tool_calls", None) or []
+            serialized_calls = self._serialize_tool_calls(raw_tool_calls)
+
+            assistant_record: Dict[str, Any] = {"role": "assistant", "content": content}
+            if serialized_calls:
+                assistant_record["tool_calls"] = serialized_calls
+            messages.append(assistant_record)
+
+            # No tool calls → model is done.  Surface the final text.
+            if not serialized_calls:
+                final_text = content
+                stop_reason = "completed"
+                break
+
+            # Dispatch each tool call sequentially (parallel exec arrives in Phase 7+).
+            for tc in serialized_calls:
+                fn = tc["function"]
+                name = fn["name"]
+                args = self._parse_tool_arguments(fn["arguments"])
+                self._vprint(f"[loop]   tool: {name}({list(args.keys())})")
+                result = self._dispatch_tool_call(name, args)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": result if isinstance(result, str) else str(result),
+                })
+                if self.tool_delay:
+                    time.sleep(self.tool_delay)
+
+        else:
+            # Loop exhausted max_iterations cleanly.
+            stop_reason = "max_iterations" if api_call_count >= self.max_iterations else stop_reason
+
+        # If we never hit the "no tool_calls" branch, fall back to the last
+        # assistant content (or empty string) so the caller always sees text.
+        if not final_text:
+            for msg in reversed(messages):
+                if msg.get("role") == "assistant":
+                    final_text = msg.get("content") or ""
+                    break
+
+        return {
+            "final_response": final_text,
+            "messages": messages,
+            "api_calls": api_call_count,
+            "stop_reason": stop_reason,
+            "iterations_used": self.iteration_budget.used,
+        }
+
+    # ── convenience entry ───────────────────────────────────────────
+
+    def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
+        """Send a single message and return the model's final text reply.
+
+        Thin wrapper around ``run_conversation`` for callers that only
+        need the text and don't care about the message history.
+        """
+        result = self.run_conversation(message, stream_callback=stream_callback)
+        return result.get("final_response", "")
+
+    def request_interrupt(self, message: Optional[str] = None) -> None:
+        """Ask the loop to stop after the current turn.  Thread-safe."""
+        self._interrupt_requested = True
+        if message:
+            logger.info("interrupt requested: %s", message)
+
+
+# ── CLI entry (`python run_agent.py ...`) ──────────────────────────────
+
+def main(
+    message: Optional[str] = None,
+    *,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    max_iterations: int = 90,
+    max_tokens: Optional[int] = None,
+    verbose: bool = False,
+    quiet: bool = False,
+    system: Optional[str] = None,
+) -> int:
+    """Bare-bones CLI entry — bypass ``hermes_cli`` and call the agent directly.
+
+    Examples::
+
+        python run_agent.py --message "Hello" --model gpt-4o-mini
+        python run_agent.py "Hello" --model gpt-4o-mini --base-url ...
+
+    Returns the process exit code (0 = success, 1 = failure).
+    """
+    if verbose:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+
+    if not message:
+        print("error: --message <text> is required", file=sys.stderr)
+        return 2
+
+    resolved_model = model or os.environ.get("PHALANX_MODEL") or os.environ.get("OPENAI_MODEL", "")
+    if not resolved_model:
+        print(
+            "error: --model <name> is required (or set PHALANX_MODEL / OPENAI_MODEL)",
+            file=sys.stderr,
+        )
+        return 2
+
+    agent = AIAgent(
+        base_url=base_url,
+        api_key=api_key,
+        model=resolved_model,
+        max_iterations=max_iterations,
+        max_tokens=max_tokens,
+        verbose_logging=verbose,
+        quiet_mode=quiet,
+        ephemeral_system_prompt=system,
+    )
+    try:
+        result = agent.run_conversation(message)
+    except Exception as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        agent.close()
+
+    print(result.get("final_response", ""))
+    if verbose:
+        print(
+            f"\n[done] turns={result['api_calls']} stop={result['stop_reason']} "
+            f"budget={result['iterations_used']}/{agent.max_iterations}",
+            file=sys.stderr,
+        )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    try:
+        import fire
+    except ImportError:
+        print("error: 'fire' package required for CLI; install with: pip install fire", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(fire.Fire(main))
