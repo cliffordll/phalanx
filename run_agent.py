@@ -741,10 +741,14 @@ class AIAgent:
             [copy.deepcopy(m) for m in conversation_history] if conversation_history else []
         )
 
-        effective_system = (
-            system_message
-            or self.ephemeral_system_prompt
-            or "You are a helpful AI assistant with access to tools."
+        # Assemble identity + environment + project context + caller overrides.
+        # build_system_prompt handles SOUL.md / .hermes.md / AGENTS.md /
+        # CLAUDE.md / .cursorrules discovery, WSL hints, and slot ordering.
+        from agent.prompt_builder import build_system_prompt
+        effective_system = build_system_prompt(
+            user_system=system_message,
+            ephemeral=self.ephemeral_system_prompt,
+            cwd=os.getcwd(),
         )
         # Ensure system message is first.
         if not messages or messages[0].get("role") != "system":
@@ -772,12 +776,39 @@ class AIAgent:
 
             self._vprint(f"[loop] turn {api_call_count}: calling {self.model}")
 
-            try:
-                response = self._call_chat_completions(messages, tools)
-            except Exception as exc:
-                stop_reason = f"api_error:{type(exc).__name__}"
-                logger.error("API call failed permanently: %s", exc)
-                final_text = f"[error] API call failed: {exc}"
+            # API call with classify-and-retry — covers transient network /
+            # provider errors without burning the whole iteration budget.
+            # Helpers ``_classify_error`` / ``_retry_delay`` (run_agent.py:187-208)
+            # have been wired up for a while; this block finally consumes them.
+            response = None
+            attempt = 0
+            max_api_attempts = 5
+            while True:
+                try:
+                    response = self._call_chat_completions(messages, tools)
+                    break
+                except Exception as exc:
+                    attempt += 1
+                    classification = _classify_error(
+                        exc, provider="openai", model=self.model,
+                    )
+                    if not getattr(classification, "retryable", False) or attempt >= max_api_attempts:
+                        stop_reason = f"api_error:{type(exc).__name__}"
+                        logger.error(
+                            "API call failed permanently after %d attempt(s): %s",
+                            attempt, exc,
+                        )
+                        final_text = f"[error] API call failed: {exc}"
+                        break
+                    delay = _retry_delay(attempt)
+                    logger.warning(
+                        "API call failed (attempt %d/%d) — retrying in %.1fs: %s",
+                        attempt, max_api_attempts, delay, exc,
+                    )
+                    time.sleep(delay)
+            if response is None:
+                # All retries exhausted (or non-retryable).  stop_reason and
+                # final_text were already populated above.
                 break
 
             choice = response.choices[0] if getattr(response, "choices", None) else None
