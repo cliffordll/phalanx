@@ -51,3 +51,16 @@ include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# Conservative selection during early phases — only catch real bugs.
+# F   = pyflakes (undef vars, unused imports)
+# E9  = SyntaxError / IndentationError
+# Expand later (e.g. add I for import sorting, B for bugbear) once the
+# ported hermes code has settled.
+select = ["F", "E9"]
+exclude = ["build", "dist", ".venv", "__pycache__"]

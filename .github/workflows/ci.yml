@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Allow manual trigger from the Actions tab for ad-hoc runs.
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same ref when a new commit lands —
+# avoids wasted minutes on superseded commits.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ci:
+    name: Lint + Import + Test + Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Editable install pulls in runtime deps + [dev] (ruff, pytest, pytest-asyncio).
+          # build + twine are CI-only utilities, installed separately.
+          pip install -e ".[dev]"
+          pip install build twine
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Import smoke (Phase 0 modules)
+        run: |
+          python -c "import hermes_constants, hermes_logging, hermes_time, utils"
+          python -c "import agent, tools, hermes_cli"
+          python -c "from hermes_constants import get_hermes_home; print('PHALANX_HOME default ->', get_hermes_home())"
+
+      - name: Run tests (allowed to be empty during Phase 0/1)
+        run: |
+          python -m pytest tests/ || ec=$?
+          ec=${ec:-0}
+          # pytest exits 5 when no tests are collected — acceptable until Phase 1 lands.
+          if [ "$ec" = "5" ]; then
+            echo "::notice ::No tests collected yet — accepted during early phases."
+            exit 0
+          fi
+          exit "$ec"
+
+      - name: Build sdist + wheel
+        run: |
+          python -m build
+          ls -la dist/
+
+      - name: Verify artifact metadata (twine check)
+        run: twine check dist/*
