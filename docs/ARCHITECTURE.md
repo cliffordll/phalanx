@@ -217,8 +217,10 @@ phalanx/
 
      while iteration_budget.remaining > 0:
          iteration_budget.consume()
-         response = self._call_chat_completions(messages, tools)
-         # ↳ POST http://localhost:11434/v1/chat/completions
+         response = self._make_api_call(messages, tools)
+         # ↳ dispatcher → _call_chat_completions / _call_anthropic_messages /
+         #   _call_codex_responses based on self.provider; OpenAI-compat path:
+         #   POST http://localhost:11434/v1/chat/completions
          #   { model: 'qwen2.5:1.5b', messages, tools: [...] }
 
          msg = response.choices[0].message

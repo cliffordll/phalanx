@@ -77,7 +77,7 @@ phalanx 的 `_serialize_tool_calls` **不对应**上游的同名函数。上游 
 
 | 上游 | phalanx | 备注 |
 |---|---|---|
-| `_interruptible_api_call(...)` 包了中断 + 流式回调 + 完整重试机制 | `_call_chat_completions(messages, tools)` 直接调 SDK | |
+| `_interruptible_api_call(...)` 包了中断 + 流式回调 + 完整重试机制 | `_make_api_call(messages, tools)` dispatcher（按 `provider` 分流到 `_call_chat_completions` / `_call_anthropic_messages` / `_call_codex_responses`），retry loop 在 dispatcher 内 | 名字与上游对齐：`_call_chat_completions` 仍是 OpenAI-compat 那一支的 helper（对应上游同名 closure） |
 | **流式响应** via `stream_callback`：增量返回 delta，TTS / UI 可同步消费 | 接收 `stream_callback` 参数但忽略 ⚠️ | 待 §2.4 |
 | API 错误分类 + 重试：`_classify_error` → `retryable / should_compress / should_rotate_credential` 三态决策；`_retry_delay(attempt)` 抖动退避 | `try/except`，单次失败直接 break ⚠️ | **helper 已存在，主循环没接**——P0 |
 | **fallback model 切换**：primary 模型连续失败 → 切到 `fallback_model`；下一轮 `_restore_primary_runtime` 切回 | 无 | |
@@ -147,13 +147,13 @@ phalanx 的 `_serialize_tool_calls` **不对应**上游的同名函数。上游 
 按"最小代码改动 / 最大收益"排序：
 
 1. **P0：API 错误重试**（~40 行）
-   - 位置：`run_conversation` 主循环里 `_call_chat_completions` 的 `try/except` 块
+   - 位置：`run_conversation` 主循环里 `_make_api_call` 的 `try/except` 块
    - 现状：`except: break`
    - 目标：调用 `_classify_error(exc)`，按 `retryable` 决定是否重试，用 `_retry_delay(attempt)` 计算退避；非 retryable 才 break
    - **helper 已就绪**（`run_agent.py:187-208`），只需主循环接入
 
 2. **P1：流式响应**（~80 行 + provider 桥）
-   - 拓展 `_call_chat_completions` 接受 `stream_callback`
+   - 拓展 `_call_chat_completions` 接受 `stream_callback`（已落地——同名 helper 即上游 closure 的对应实现）
    - delta 增量回调
    - 等 §2.4 多 provider 适配层落地后一起做
 

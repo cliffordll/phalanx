@@ -449,7 +449,7 @@ def _anthropic_response_to_openai_shape(response: Any) -> Any:
 # ── Provider detection ──────────────────────────────────────────────────
 # Inspect the base_url to guess which adapter should handle a turn.
 # Phase 2.4 wave 2 only uses this to advertise an "active" provider in
-# `hermes provider list`; full SDK routing inside _call_chat_completions
+# `hermes provider list`; full SDK routing inside _make_api_call
 # is gated by §2.4 wave 3 (driven by an actual Claude usage signal).
 
 _ANTHROPIC_HOSTS = ("api.anthropic.com",)
@@ -626,7 +626,7 @@ class AIAgent:
         self._api_call_count = 0
         self._interrupt_requested = False
         # Streaming callback — set by run_conversation when the caller
-        # provides one; consumed by _call_chat_completions to decide
+        # provides one; consumed by _make_api_call to decide
         # streaming vs non-streaming.
         self._stream_callback: Optional[Callable[[str], None]] = None
 
@@ -1010,58 +1010,42 @@ class AIAgent:
         h = hashlib.sha1(f"{fn_name}|{arguments}|{index}".encode("utf-8")).hexdigest()
         return f"call_{h[:24]}"
 
-    # ── API call with retry ─────────────────────────────────────────
+    # ── API call dispatch + retry ───────────────────────────────────
 
-    def _call_chat_completions(
+    def _make_api_call(
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
     ) -> Any:
-        """Invoke the model API with retries on retryable errors.
+        """Run one API round-trip with retry, branching on ``self.provider``.
 
-        When ``self.provider == "anthropic"``, dispatches to
-        ``_call_anthropic_messages``; the Anthropic Messages response is
-        wrapped in a ``SimpleNamespace`` shaped like an OpenAI ChatCompletion
-        so the rest of ``run_conversation`` is provider-agnostic.
+        Mirrors upstream's ``_interruptible_api_call`` dispatcher
+        (run_agent.py:6352) — same shape: pick a per-provider helper, run
+        it, retry on retryable errors.  Phalanx omits the interrupt-thread
+        machinery (deferred to a later phase); each helper is invoked
+        directly on the agent thread.
 
-        Otherwise calls ``client.chat.completions.create``.  When
-        ``self._stream_callback`` is set the SDK is asked to stream and the
-        resulting chunks are accumulated into the same non-streaming-shaped
-        object; each text delta is forwarded to the callback live so a TTY
-        / TTS consumer can show progress before the full reply lands.  The
-        anthropic route uses ``client.messages.stream(...)`` (event-based
-        protocol — see ``_accumulate_anthropic_stream``); the OpenAI-compat
-        route uses ``stream=True`` on ``chat.completions.create``.
+        Per-provider helpers (each accept the same ``messages, tools,
+        stream_callback`` signature so naming stays parallel with upstream):
+        - ``_call_chat_completions`` — OpenAI-compatible chat.completions
+        - ``_call_anthropic_messages`` — Anthropic Messages API
+        - ``_call_codex_responses`` — OpenAI Responses API (codex / gpt-5)
 
         Retries are gated by ``self.iteration_budget.remaining`` so an
         agent stuck in retry loops cannot exceed its budget.
         """
         stream_callback: Optional[Callable[[str], None]] = self._stream_callback
-        is_anthropic = self.provider == "anthropic"
-        is_codex = self.provider == "codex"
 
         attempt = 0
         last_exc: Optional[Exception] = None
         while True:
             attempt += 1
             try:
-                if is_anthropic:
+                if self.provider == "anthropic":
                     return self._call_anthropic_messages(messages, tools, stream_callback)
-                if is_codex:
+                if self.provider == "codex":
                     return self._call_codex_responses(messages, tools, stream_callback)
-                client = self._get_openai_client()
-                api_kwargs: Dict[str, Any] = {
-                    "model": self.model,
-                    "messages": messages,
-                }
-                if tools:
-                    api_kwargs["tools"] = tools
-                if self.max_tokens is not None:
-                    api_kwargs["max_tokens"] = self.max_tokens
-                if stream_callback is None:
-                    return client.chat.completions.create(**api_kwargs)
-                stream = client.chat.completions.create(stream=True, **api_kwargs)
-                return _accumulate_stream(stream, stream_callback)
+                return self._call_chat_completions(messages, tools, stream_callback)
             except Exception as exc:
                 last_exc = exc
                 classified = _classify_error(exc, provider=self.provider, model=self.model)
@@ -1077,6 +1061,36 @@ class AIAgent:
 
         # Unreachable; mypy guard.
         raise last_exc if last_exc else RuntimeError("unreachable")
+
+    def _call_chat_completions(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        stream_callback: Optional[Callable[[str], None]] = None,
+    ) -> Any:
+        """Send one ``chat.completions.create`` round-trip (OpenAI-compatible).
+
+        Mirrors the upstream closure of the same name
+        (run_agent.py:6753) — handles only the OpenAI-compatible chat
+        completions path.  When ``stream_callback`` is set the SDK is
+        asked to stream and the chunks are accumulated through
+        ``_accumulate_stream`` so each text delta is forwarded live; the
+        return shape is the same non-streaming-shaped ``SimpleNamespace``
+        either way so the run loop in ``run_conversation`` is unchanged.
+        """
+        client = self._get_openai_client()
+        api_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+        }
+        if tools:
+            api_kwargs["tools"] = tools
+        if self.max_tokens is not None:
+            api_kwargs["max_tokens"] = self.max_tokens
+        if stream_callback is None:
+            return client.chat.completions.create(**api_kwargs)
+        stream = client.chat.completions.create(stream=True, **api_kwargs)
+        return _accumulate_stream(stream, stream_callback)
 
     def _call_anthropic_messages(
         self,
@@ -1274,7 +1288,7 @@ class AIAgent:
             max_api_attempts = 5
             while True:
                 try:
-                    response = self._call_chat_completions(messages, tools)
+                    response = self._make_api_call(messages, tools)
                     break
                 except Exception as exc:
                     attempt += 1
