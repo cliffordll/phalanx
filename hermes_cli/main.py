@@ -88,6 +88,8 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="cap on tool-calling iterations (default 90)")
     p_one.add_argument("--max-tokens", type=int, default=None,
                        help="max tokens for the model response")
+    p_one.add_argument("--dump-messages", action="store_true",
+                       help="after replying, print the full messages array as JSON to stderr")
     p_one.set_defaults(func=cmd_oneshot)
 
     # chat -------------------------------------------------------------
@@ -131,6 +133,20 @@ def _build_parser() -> argparse.ArgumentParser:
     p_cfg_get.add_argument("key", help="dotted key path, e.g. model.default")
     p_cfg_get.set_defaults(func=cmd_config_get)
     p_cfg.set_defaults(func=cmd_config_help)
+
+    # prompt -----------------------------------------------------------
+    p_prompt = sub.add_parser("prompt", help="inspect the assembled system prompt")
+    p_prompt_sub = p_prompt.add_subparsers(dest="prompt_cmd", metavar="<subcmd>")
+    p_prompt_show = p_prompt_sub.add_parser("show",
+        help="dump the system prompt that AIAgent would build for this cwd")
+    p_prompt_show.add_argument("--raw", action="store_true",
+                               help="skip project context-file discovery (just identity + env)")
+    p_prompt_show.add_argument("--system", default=None,
+                               help="optional caller --system override to splice in")
+    p_prompt_show.add_argument("--cwd", default=None,
+                               help="working directory used for context discovery (default: $PWD)")
+    p_prompt_show.set_defaults(func=cmd_prompt_show)
+    p_prompt.set_defaults(func=cmd_prompt_help)
 
     # model ------------------------------------------------------------
     p_model = sub.add_parser("model", help="inspect model metadata / context windows")
@@ -264,6 +280,15 @@ def cmd_oneshot(args: argparse.Namespace) -> int:
             f"\n[done] turns={result['api_calls']} stop={result['stop_reason']} "
             f"budget={result['iterations_used']}/{agent.max_iterations}\n"
         )
+    if getattr(args, "dump_messages", False):
+        # Goes to stderr so it doesn't pollute the captured final_response;
+        # callers who pipe stdout into another tool still see the dump
+        # interleaved when they want both (e.g. `... 2>&1 | jq ...`).
+        sys.stderr.write("\n--- messages ---\n")
+        sys.stderr.write(json.dumps(
+            result.get("messages", []), ensure_ascii=False, indent=2,
+        ))
+        sys.stderr.write("\n")
     return 0
 
 
@@ -429,6 +454,28 @@ def cmd_tools_dry_run(args: argparse.Namespace) -> int:
         ensure_ascii=False, indent=2,
     ))
     return 1
+
+
+def cmd_prompt_help(args: argparse.Namespace) -> int:
+    print("usage: hermes prompt <show> ...")
+    return 0
+
+
+def cmd_prompt_show(args: argparse.Namespace) -> int:
+    """Dump the system prompt that AIAgent would assemble for this cwd.
+
+    With --raw, skip project context-file discovery (.hermes.md, AGENTS.md,
+    CLAUDE.md, .cursorrules) and just emit identity + environment hints.
+    """
+    from agent.prompt_builder import build_system_prompt
+    prompt = build_system_prompt(
+        user_system=args.system,
+        ephemeral=None,
+        cwd=args.cwd,
+        include_context_files=not args.raw,
+    )
+    print(prompt)
+    return 0
 
 
 def cmd_model_help(args: argparse.Namespace) -> int:
