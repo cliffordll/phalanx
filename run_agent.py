@@ -572,6 +572,9 @@ class AIAgent:
         ephemeral_system_prompt: Optional[str] = None,
         iteration_budget: Optional[IterationBudget] = None,
         provider: Optional[str] = None,
+        session_db: Optional[Any] = None,
+        platform: str = "cli",
+        parent_session_id: Optional[str] = None,
     ):
         """Initialize the AI Agent.
 
@@ -644,6 +647,17 @@ class AIAgent:
             self._todo_store = TodoStore()
         except Exception:
             self._todo_store = None
+
+        # Session DB persistence (§2.5 wave 2).  ``session_db=None`` means
+        # ephemeral — no DB writes.  Row creation is deferred to the
+        # first ``run_conversation`` so transient SQLite failures don't
+        # block construction.
+        self._session_db = session_db
+        self._session_db_created = False
+        self._last_flushed_db_idx = 0
+        self._parent_session_id = parent_session_id
+        self._cached_system_prompt: Optional[str] = None
+        self.platform = platform
 
     # ── small helpers ────────────────────────────────────────────────
 
@@ -1199,6 +1213,85 @@ class AIAgent:
             stream_callback,
         )
 
+    # ── session DB persistence (§2.5 wave 2) ────────────────────────
+
+    def _ensure_db_session(self) -> None:
+        """Create the session row on first use.  No-op if ``_session_db`` is None.
+
+        Mirrors upstream ``run_agent.py`` (line 2188) — wraps
+        ``create_session`` in try/except so a transient SQLite failure
+        leaves ``_session_db_created=False`` and the next
+        ``run_conversation`` call gets to retry.
+        """
+        if self._session_db_created or self._session_db is None:
+            return
+        try:
+            self._session_db.create_session(
+                session_id=self.session_id,
+                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model=self.model,
+                system_prompt=self._cached_system_prompt,
+                user_id=None,
+                parent_session_id=self._parent_session_id,
+            )
+            self._session_db_created = True
+        except Exception as e:
+            logger.warning(
+                "Session DB creation failed (will retry next turn): %s", e
+            )
+
+    def _persist_messages_to_db(
+        self,
+        messages: List[Dict[str, Any]],
+        conversation_history: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Flush newly-appended messages to the session DB.
+
+        Walks ``messages[self._last_flushed_db_idx:]`` and
+        ``append_message``s each one.  Skips any messages that were part
+        of the pre-loaded ``conversation_history`` so resume doesn't
+        double-write earlier turns.
+
+        DB failures are warned and swallowed — persistence must never
+        block the agent loop.  Mirrors upstream ``run_agent.py:~3750``.
+        """
+        if self._session_db is None:
+            return
+        if not self._session_db_created:
+            self._ensure_db_session()
+        if not self._session_db_created:
+            # Creation still failing — skip this flush; we'll retry next
+            # turn.  Don't advance ``_last_flushed_db_idx`` so the rows
+            # land once the DB recovers.
+            return
+        try:
+            start_idx = len(conversation_history) if conversation_history else 0
+            flush_from = max(start_idx, self._last_flushed_db_idx)
+            for msg in messages[flush_from:]:
+                role = msg.get("role", "unknown")
+                content = msg.get("content")
+                tool_calls_data = None
+                raw_tool_calls = msg.get("tool_calls")
+                if isinstance(raw_tool_calls, list) and raw_tool_calls:
+                    tool_calls_data = raw_tool_calls
+                self._session_db.append_message(
+                    session_id=self.session_id,
+                    role=role,
+                    content=content,
+                    tool_name=msg.get("tool_name"),
+                    tool_calls=tool_calls_data,
+                    tool_call_id=msg.get("tool_call_id"),
+                    finish_reason=msg.get("finish_reason"),
+                    reasoning=msg.get("reasoning") if role == "assistant" else None,
+                    reasoning_content=msg.get("reasoning_content") if role == "assistant" else None,
+                    reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
+                    codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
+                    codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                )
+            self._last_flushed_db_idx = len(messages)
+        except Exception as e:
+            logger.warning("Session DB append_message failed: %s", e)
+
     # ── main conversation loop ───────────────────────────────────────
 
     def run_conversation(
@@ -1260,6 +1353,29 @@ class AIAgent:
             messages[0]["content"] = effective_system
 
         messages.append({"role": "user", "content": user_message})
+
+        # Cache the assembled system prompt so _ensure_db_session can
+        # snapshot it onto the session row.
+        self._cached_system_prompt = effective_system
+
+        # Reset the flush cursor at the start of each conversation so a
+        # reused agent doesn't try to reach back across a truncated
+        # ``messages`` list.  Pre-loaded conversation_history rows are
+        # skipped inside _persist_messages_to_db itself.
+        self._last_flushed_db_idx = 0
+        self._ensure_db_session()
+        if self._session_db is not None and self._session_db_created:
+            try:
+                self._session_db.update_system_prompt(
+                    self.session_id, effective_system
+                )
+            except Exception as e:
+                logger.warning("Session DB update_system_prompt failed: %s", e)
+        # Flush the seeded user message (and any pre-existing turns
+        # past the conversation_history boundary) before the first API
+        # call so a crash mid-turn still leaves the user's prompt
+        # recorded.
+        self._persist_messages_to_db(messages, conversation_history)
 
         tools = self._resolve_tool_schemas()
         api_call_count = 0
@@ -1333,6 +1449,7 @@ class AIAgent:
             if not serialized_calls:
                 final_text = content
                 stop_reason = "completed"
+                self._persist_messages_to_db(messages, conversation_history)
                 break
 
             # Dispatch the whole batch through the tool-execution subsystem.
@@ -1345,6 +1462,11 @@ class AIAgent:
                 api_call_count=api_call_count,
             )
 
+            # Flush this turn's assistant + tool messages.  Done after
+            # ``_execute_tool_calls`` so each turn lands as one atomic
+            # unit; on DB failure we just warn and keep looping.
+            self._persist_messages_to_db(messages, conversation_history)
+
         else:
             # Loop exhausted max_iterations cleanly.
             stop_reason = "max_iterations" if api_call_count >= self.max_iterations else stop_reason
@@ -1356,6 +1478,16 @@ class AIAgent:
                 if msg.get("role") == "assistant":
                     final_text = msg.get("content") or ""
                     break
+
+        # Final flush + end_session — covers the budget_exhausted /
+        # max_iterations / interrupted / api_error paths that didn't go
+        # through the in-loop break flush.
+        self._persist_messages_to_db(messages, conversation_history)
+        if self._session_db is not None and self._session_db_created:
+            try:
+                self._session_db.end_session(self.session_id, end_reason=stop_reason)
+            except Exception as e:
+                logger.warning("Session DB end_session failed: %s", e)
 
         return {
             "final_response": final_text,
