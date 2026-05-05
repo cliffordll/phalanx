@@ -18,7 +18,7 @@
 | 4 | `_accumulate_anthropic_stream` (event-based via `messages.stream()`) + `stub_anthropic` 双队列 | `33572f6` |
 | 5 | `agent/codex_responses_adapter.py`（verbatim 999 行）+ `_call_codex_responses` + `_codex_response_to_openai_shape` | `62092e6` |
 | 6 | `_accumulate_codex_stream` (event-based via `responses.stream()`) + `stub_codex` 双队列 | `62092e6` |
-| 收尾 | `_make_api_call` dispatcher 重构 — 与上游 `_interruptible_api_call` 命名对齐 | uncommitted |
+| 收尾 | `_make_api_call` dispatcher 重构 — 与上游 `_interruptible_api_call` 命名对齐 | `e0eefa2` |
 
 §2.4 落地后 phalanx 同时支持三个 provider 的非流式 + 流式路径；bedrock / gemini 仍按需移。
 
