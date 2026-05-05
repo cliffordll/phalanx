@@ -235,9 +235,23 @@ def test_dispatch_stub_command_prints_message(capsys):
 
 
 def test_dispatch_alias_routes_to_canonical(capsys):
-    """``/reset`` (alias of /new) hits /new's stub line, not 'unknown'."""
+    """``/reset`` (alias of /new) hits /new's handler, not 'unknown'."""
     import cli
-    cli._dispatch_slash("/reset", {})
+    import uuid
+
+    class _FakeAgent:
+        session_id = str(uuid.uuid4())
+        _session_db_created = True
+        _last_flushed_db_idx = 5
+
+    state = {"agent": _FakeAgent(), "history": [{"role": "user", "content": "x"}]}
+    cli._dispatch_slash("/reset", state)
     captured = capsys.readouterr()
-    assert "/new" in captured.out
+    # /new prints "started new session (<8-char id>)" — not the stub
+    # message.  This proves /reset routed through resolve_command to
+    # the canonical /new handler.
+    assert "started new session" in captured.out
     assert "unknown command" not in captured.out
+    assert state["history"] == []
+    assert state["agent"]._session_db_created is False
+    assert state["agent"]._last_flushed_db_idx == 0

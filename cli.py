@@ -163,6 +163,91 @@ def main(
 # ── Internals ──────────────────────────────────────────────────────────
 
 
+def _print_random_tip() -> None:
+    """Show one random tip from ``hermes_cli.tips`` at REPL startup.
+
+    Best-effort — if the tips module is missing or empty we just
+    skip silently rather than failing.
+    """
+    try:
+        from hermes_cli.tips import pick_tip
+        tip = pick_tip()
+    except Exception:
+        return
+    if tip:
+        print(f"tip: {tip}")
+
+
+def _open_stream_context():
+    """Return a context manager wrapping ``run_conversation``.
+
+    Tries ``prompt_toolkit.patch_stdout`` first so streaming token
+    deltas paint above the live prompt line.  ``patch_stdout`` can
+    raise on ``__enter__`` (e.g. on Windows under msys2 / pytest
+    where the console buffer probe fails).  When that happens or
+    prompt_toolkit isn't available, falls back to a no-op context
+    manager so streaming still works — just without prompt-aware
+    redraw.
+    """
+    if _PT_AVAILABLE:
+        try:
+            from prompt_toolkit.patch_stdout import patch_stdout
+            ctx = patch_stdout()
+            # Probe: enter / exit immediately to surface backend errors
+            # while we can still fall back.  Cheap on a working TTY.
+            ctx.__enter__()
+            ctx.__exit__(None, None, None)
+            return patch_stdout()
+        except Exception:
+            return _NullContext()
+    return _NullContext()
+
+
+def _run_turn(agent, message: str, history):
+    """Run one conversation turn, streaming token deltas to stdout.
+
+    Wraps the call in ``patch_stdout`` (when supported) so the
+    prompt line stays put while the model paints its reply above
+    it.  When prompt_toolkit's terminal probe fails we fall back to
+    plain stdout writes — same streaming, just no prompt-aware
+    redraw.
+    """
+    streamed: list[str] = []
+
+    def stream_callback(delta: str) -> None:
+        sys.stdout.write(delta)
+        sys.stdout.flush()
+        streamed.append(delta)
+
+    with _open_stream_context():
+        result = agent.run_conversation(
+            message,
+            conversation_history=history,
+            stream_callback=stream_callback,
+        )
+
+    final = result.get("final_response", "")
+    if streamed:
+        # Model already painted everything via the callback; just
+        # close the line so the next prompt starts cleanly.
+        sys.stdout.write("\n")
+    elif final:
+        # Non-streaming path (callback never fired) — print the full
+        # reply.  Common for tool-only turns where deltas are empty.
+        print(final)
+    return result
+
+
+class _NullContext:
+    """A trivial context manager used when ``patch_stdout`` is unavailable."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
 def _run_oneshot(agent, query: str, *, verbose: bool) -> int:
     try:
         result = agent.run_conversation(query)
@@ -223,19 +308,207 @@ def _cmd_exit(args: str, state: dict) -> str:
 def _cmd_stub(name: str) -> Any:
     """Return a handler that prints 'not yet implemented' for *name*."""
     def _h(args: str, state: dict) -> None:
-        print(f"/{name}: not yet implemented in phalanx (Phase 2.6 wave 3+)")
+        print(f"/{name}: not yet implemented in phalanx (Phase 2.7+)")
         return None
     return _h
 
 
-# Dispatch table — wave 2 wires only ``/help`` and the exit aliases.
-# Real handlers for ``/new`` / ``/clear`` / ``/history`` / ``/model`` /
-# ``/tools`` / ``/debug`` / ``/save`` / ``/resume`` land in wave 3 by
-# replacing entries here.
+# ── wave 3 handlers ─────────────────────────────────────────────────────
+
+
+def _cmd_new(args: str, state: dict) -> None:
+    """Reset the in-process history + give the agent a fresh session id.
+
+    The previous session row stays in ``state.db`` so ``/resume`` can
+    find it; we just stop appending to it.  Resets the flush cursor
+    so the next turn writes starting from message index 0.
+    """
+    import uuid
+    agent = state["agent"]
+    agent.session_id = str(uuid.uuid4())
+    agent._session_db_created = False
+    agent._last_flushed_db_idx = 0
+    state["history"] = []
+    print(f"started new session ({agent.session_id[:8]})")
+    return None
+
+
+def _cmd_clear(args: str, state: dict) -> None:
+    """Clear the screen, then act like ``/new``."""
+    os.system("cls" if os.name == "nt" else "clear")
+    return _cmd_new(args, state)
+
+
+def _cmd_history(args: str, state: dict) -> None:
+    """Print the current in-process conversation history."""
+    history = state.get("history") or []
+    if not history:
+        print("(no messages yet)")
+        return None
+    for i, msg in enumerate(history):
+        role = msg.get("role") or "?"
+        content = msg.get("content") or ""
+        if isinstance(content, list):
+            # Multimodal payload — show a short marker rather than
+            # dumping the JSON.
+            content = f"<{len(content)} content parts>"
+        text = str(content).replace("\n", " ")
+        if len(text) > 80:
+            text = text[:77] + "..."
+        print(f"  [{i}] {role}: {text}")
+    return None
+
+
+def _cmd_model(args: str, state: dict) -> None:
+    """Show or switch the agent's model.
+
+    Bare ``/model`` prints the current model.  ``/model <name>``
+    swaps it; the next turn picks up the new value.  Phalanx doesn't
+    re-validate the model name against ``provider list`` here —
+    invalid names surface as an API error on the next turn, which
+    matches upstream behavior.
+    """
+    agent = state["agent"]
+    name = args.strip()
+    if not name:
+        print(f"current model: {agent.model}")
+        return None
+    old = agent.model
+    agent.model = name
+    print(f"model: {old} -> {name}")
+    return None
+
+
+def _cmd_debug(args: str, state: dict) -> None:
+    """Toggle ``agent.verbose_logging``.
+
+    Subcommands: ``on`` / ``off`` / ``status`` (default ``status``
+    when called bare).  Also flips the root logger level so the
+    change takes effect immediately for any module already
+    importing ``logging.getLogger(__name__)``.
+    """
+    agent = state["agent"]
+    sub = args.strip().lower() or "status"
+    if sub == "on":
+        agent.verbose_logging = True
+        logging.getLogger().setLevel(logging.DEBUG)
+        print("debug: on")
+    elif sub == "off":
+        agent.verbose_logging = False
+        logging.getLogger().setLevel(logging.WARNING)
+        print("debug: off")
+    elif sub == "status":
+        flag = "on" if agent.verbose_logging else "off"
+        print(f"debug: {flag}")
+    else:
+        print(f"/debug: unknown sub-action {sub!r} (use on / off / status)")
+    return None
+
+
+def _cmd_tools(args: str, state: dict) -> None:
+    """List or toggle available tools.
+
+    ``/tools`` and ``/tools list`` print the registry.  ``/tools
+    disable <name>`` adds *name* to ``agent.disabled_toolsets``;
+    ``/tools enable <name>`` removes it.  The schemas cache is
+    invalidated so the change takes effect on the next turn.
+    """
+    agent = state["agent"]
+    sub, _, rest = args.strip().partition(" ")
+    sub = sub or "list"
+    if sub == "list":
+        registry = getattr(agent, "_tool_registry", None)
+        if registry is None:
+            print("(no tool registry loaded)")
+            return None
+        names = registry.get_all_tool_names()
+        if not names:
+            print("(no tools registered)")
+            return None
+        for name in names:
+            toolset = registry.get_toolset_for_tool(name) or "?"
+            schema = registry.get_schema(name) or {}
+            desc_first_line = (schema.get("description") or "").splitlines()
+            desc = desc_first_line[0] if desc_first_line else ""
+            disabled = (
+                " (disabled)" if toolset in (agent.disabled_toolsets or [])
+                else ""
+            )
+            print(f"  {name:24s} [{toolset}]{disabled}  {desc}")
+        return None
+    if sub in ("disable", "enable"):
+        target = rest.strip()
+        if not target:
+            print(f"/tools {sub}: missing tool / toolset name")
+            return None
+        disabled = list(agent.disabled_toolsets or [])
+        if sub == "disable":
+            if target not in disabled:
+                disabled.append(target)
+            print(f"disabled: {target}")
+        else:
+            disabled = [t for t in disabled if t != target]
+            print(f"enabled: {target}")
+        agent.disabled_toolsets = disabled
+        agent._tool_schemas_cache = None
+        return None
+    print(f"/tools: unknown sub-action {sub!r} (use list / disable / enable)")
+    return None
+
+
+def _cmd_resume(args: str, state: dict) -> None:
+    """Resume a previously-stored session in-place.
+
+    Resolves a full id or a unique prefix via SessionDB, replays the
+    history into ``state['history']`` so the next turn carries the
+    full context, and re-points ``agent.session_id`` so writes land
+    on the same row.  ``reopen_session`` undoes the prior
+    ``end_session`` so the upcoming end-of-turn close records the new
+    ``stop_reason``.
+    """
+    target = args.strip()
+    if not target:
+        print("/resume: usage /resume <session_id_or_prefix>")
+        return None
+    agent = state["agent"]
+    db = getattr(agent, "_session_db", None)
+    if db is None:
+        print("/resume: session DB unavailable in this REPL")
+        return None
+    try:
+        from hermes_state import SessionDB  # noqa: F401  (typing only)
+    except Exception as exc:  # pragma: no cover
+        print(f"/resume: session DB unavailable: {exc}")
+        return None
+    sid = db.resolve_session_id(target)
+    if not sid:
+        print(f"/resume: no matching session {target!r} (or prefix is ambiguous)")
+        return None
+    sid = db.resolve_resume_session_id(sid)
+    history = db.get_messages_as_conversation(sid)
+    db.reopen_session(sid)
+    agent.session_id = sid
+    agent._session_db_created = True
+    agent._last_flushed_db_idx = len(history)
+    state["history"] = history
+    print(f"resumed session {sid[:8]} ({len(history)} messages restored)")
+    return None
+
+
+# Dispatch table — wave 3 wires the day-to-day handlers.  Anything not
+# listed here that's still in the registry falls through to
+# ``_cmd_stub`` which prints 'not yet implemented'.
 _SLASH_HANDLERS: dict[str, Any] = {
-    "help":  _cmd_help,
-    "quit":  _cmd_exit,
-    "exit":  _cmd_exit,
+    "help":    _cmd_help,
+    "new":     _cmd_new,
+    "clear":   _cmd_clear,
+    "history": _cmd_history,
+    "model":   _cmd_model,
+    "debug":   _cmd_debug,
+    "tools":   _cmd_tools,
+    "resume":  _cmd_resume,
+    "quit":    _cmd_exit,
+    "exit":    _cmd_exit,
 }
 
 
@@ -333,8 +606,8 @@ def _run_repl(agent) -> int:
     same: ``/exit`` / ``/quit`` / ``:q`` ends the session.
     """
     print(f"phalanx chat (model={agent.model}).  Ctrl-D / Ctrl-C / /exit to quit.")
-    history: List[Dict[str, Any]] = []
-    state: Dict[str, Any] = {"agent": agent}
+    _print_random_tip()
+    state: Dict[str, Any] = {"agent": agent, "history": []}
 
     if _PT_AVAILABLE:
         session = _build_prompt_session()
@@ -361,12 +634,12 @@ def _run_repl(agent) -> int:
                 return 0
             continue
         try:
-            result = agent.run_conversation(line, conversation_history=history)
+            result = _run_turn(agent, line, state["history"])
         except Exception as exc:
             sys.stderr.write(f"[error] {exc}\n")
             continue
-        history = result["messages"]
-        print(result.get("final_response", ""))
+        state["history"] = result["messages"]
+        # Final response prints in _run_turn after streaming.
 
 
 def _warn_unsupported(**flags) -> None:
