@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-Phalanx Agent CLI — Phase 1 thin shell.
+Phalanx Agent CLI — Phase 2.6 wave 1.
 
-This is the heavily-trimmed counterpart to hermes-agent's cli.py
-(originally 12,043 lines of prompt_toolkit-based TUI).  Phase 1 keeps
-only:
+This is the trimmed counterpart to hermes-agent's cli.py (originally
+12,043 lines of prompt_toolkit-based TUI).  Wave 1 of Phase 2.6 grows
+the REPL from a Phase-1 ``input()`` loop into a real prompt_toolkit
+session with persistent history and ghost-text auto-suggestion.
 
-  - The function ``main(...)`` exported at module top-level, since
-    ``hermes_cli/main.py`` defers to it via ``from cli import main as
-    cli_main`` (matching upstream's calling convention).
-  - A direct ``python cli.py`` entry that drops the user into the same
-    plain-text REPL.
+Public surface kept stable:
 
-The full prompt_toolkit / TUI / streaming / slash-command experience
-arrives in Phase 6 (see docs/MIGRATION_PLAN.md §2.6).
+  - ``main(...)`` at module top-level, since ``hermes_cli/main.py``
+    defers to it via ``from cli import main as cli_main`` (matching
+    upstream's calling convention).
+  - ``python cli.py`` entry that drops the user into the same REPL.
+
+Slash-command dispatch + completion + ``patch_stdout`` streaming
+arrive in waves 2/3 of this phase (see ``docs/phase-2.6-repl.md``).
 
 Usage::
 
@@ -26,12 +28,27 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 # Avoid noisy startup output even if other modules log on import.
 os.environ.setdefault("HERMES_QUIET", "1")
+
+# prompt_toolkit is a soft dependency — when it can't be imported the
+# REPL falls back to a plain ``input()`` loop.  Lazy / module-level so
+# the import only fires when ``cli.py`` itself is loaded; the
+# ``hermes oneshot`` / ``hermes session`` / ``hermes tools`` paths
+# never import this module and keep their cold-start time intact.
+try:
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+    _PT_AVAILABLE = True
+except ImportError:  # pragma: no cover — exercised by the fallback test
+    _PT_AVAILABLE = False
 
 
 def _build_agent(
@@ -161,18 +178,87 @@ def _run_oneshot(agent, query: str, *, verbose: bool) -> int:
     return 0
 
 
+_EXIT_TOKENS = ("/exit", "/quit", ":q")
+
+
+def _history_path() -> Optional[Path]:
+    """Resolve the persistent CLI history file path under PHALANX_HOME.
+
+    Returns ``None`` when the home directory can't be created (e.g. a
+    read-only filesystem); the REPL then runs without persistent
+    history but still works.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+        home = get_hermes_home()
+        home.mkdir(parents=True, exist_ok=True)
+        return home / "cli_history"
+    except Exception as exc:
+        logger.debug("could not resolve history path: %s", exc)
+        return None
+
+
+def _build_prompt_session() -> "PromptSession[str]":
+    """Construct the prompt_toolkit session with history + auto-suggest.
+
+    ``Alt+Enter`` inserts a newline (multiline input); plain ``Enter``
+    submits — this is prompt_toolkit's default for ``multiline=False``
+    plus a key binding that injects a newline literal.  Slash-command
+    completion lands in wave 2; this wave wires the session shell.
+    """
+    history_obj = None
+    history_path = _history_path()
+    if history_path is not None:
+        try:
+            history_obj = FileHistory(str(history_path))
+        except Exception as exc:
+            logger.debug("FileHistory init failed: %s", exc)
+
+    bindings = KeyBindings()
+
+    @bindings.add("escape", "enter")  # Alt+Enter / Esc-then-Enter
+    def _newline(event):
+        event.app.current_buffer.insert_text("\n")
+
+    return PromptSession(
+        history=history_obj,
+        auto_suggest=AutoSuggestFromHistory() if history_obj else None,
+        key_bindings=bindings,
+        enable_history_search=True,
+        complete_while_typing=False,
+    )
+
+
 def _run_repl(agent) -> int:
+    """Drive the interactive REPL.
+
+    Uses prompt_toolkit when importable (history + auto-suggest +
+    Alt+Enter newline); falls back to a plain ``input()`` loop when
+    not (e.g. on an embedded interpreter or when prompt_toolkit
+    couldn't load).  Either way the slash-command surface stays the
+    same: ``/exit`` / ``/quit`` / ``:q`` ends the session.
+    """
     print(f"phalanx chat (model={agent.model}).  Ctrl-D / Ctrl-C / /exit to quit.")
     history: List[Dict[str, Any]] = []
+
+    if _PT_AVAILABLE:
+        session = _build_prompt_session()
+
+        def _read() -> str:
+            return session.prompt("> ")
+    else:
+        def _read() -> str:
+            return input("> ")
+
     while True:
         try:
-            line = input("> ").strip()
+            line = _read().strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
         if not line:
             continue
-        if line in ("/exit", "/quit", ":q"):
+        if line in _EXIT_TOKENS:
             return 0
         try:
             result = agent.run_conversation(line, conversation_history=history)

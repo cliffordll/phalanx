@@ -26,6 +26,11 @@ dependencies = [
   # Used by `hermes tools dry-run` to validate --args against tool schemas
   # without invoking the handler.
   "jsonschema>=4.20,<5",
+  # Phase 2.6 wave 1 — interactive REPL.  prompt_toolkit is the
+  # foundation for FileHistory, AutoSuggestFromHistory, multiline
+  # input, slash-command completion, and patch_stdout streaming.
+  # cli.py imports it lazily and falls back to input() if missing.
+  "prompt_toolkit>=3.0.50,<4",
 ]
 
 [project.optional-dependencies]
