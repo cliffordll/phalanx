@@ -232,6 +232,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sess_del.set_defaults(func=cmd_session_delete)
     p_sess.set_defaults(func=cmd_session_help)
 
+    # logs -------------------------------------------------------------
+    p_logs = sub.add_parser("logs", help="tail / filter ~/.hermes/logs/*.log")
+    p_logs.add_argument(
+        "log_name", nargs="?", default="agent",
+        help="log to read: 'agent' (default), 'errors', 'gateway', or 'list'",
+    )
+    p_logs.add_argument("-n", "--lines", type=int, default=50,
+                        help="how many recent lines to show (default 50)")
+    p_logs.add_argument("-f", "--follow", action="store_true",
+                        help="keep watching for new lines (Ctrl+C to stop)")
+    p_logs.add_argument("--level", default=None,
+                        help="minimum log level (DEBUG/INFO/WARNING/ERROR/CRITICAL)")
+    p_logs.add_argument("--session", default=None,
+                        help="filter by session id substring")
+    p_logs.add_argument("--component", default=None,
+                        help="filter by component (gateway/agent/tools/cli/cron)")
+    p_logs.add_argument("--since", default=None,
+                        help="relative time cutoff (e.g. '1h', '30m', '2d')")
+    p_logs.set_defaults(func=cmd_logs)
+
     # version ----------------------------------------------------------
     p_ver = sub.add_parser("version", help="print phalanx version")
     p_ver.set_defaults(func=cmd_version)
@@ -1062,6 +1082,26 @@ def cmd_session_delete(args: argparse.Namespace) -> int:
         return 2
     print(f"deleted session {sid}")
     return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    """Delegate to ``hermes_cli/logs.py``.
+
+    Special-cases ``hermes logs list`` so the bare ``list_logs()`` path
+    is reachable without inventing a separate subparser.
+    """
+    from hermes_cli.logs import list_logs, tail_log
+    if args.log_name == "list":
+        return list_logs()
+    return tail_log(
+        args.log_name,
+        num_lines=args.lines,
+        follow=args.follow,
+        level=args.level,
+        session=args.session,
+        since=args.since,
+        component=args.component,
+    )
 
 
 def cmd_version(args: argparse.Namespace) -> int:
