@@ -659,8 +659,8 @@ def cmd_provider_list(args: argparse.Namespace) -> int:
     statuses = {
         "openai-compatible": "wired (chat.completions, streaming)",
         "anthropic": "wired (messages.create + messages.stream)",
+        "codex": "wired (responses.create + responses.stream)",
         "bedrock": "not yet ported",
-        "codex": "not yet ported",
         "gemini": "not yet ported",
     }
     print(f"base_url: {base_url or '<unset>'}")
@@ -685,7 +685,7 @@ def cmd_provider_test(args: argparse.Namespace) -> int:
     1 + 3); ``bedrock`` / ``codex`` / ``gemini`` are still rejected up
     front rather than letting them 404 / hang against the wrong endpoint.
     """
-    _SUPPORTED = {"openai-compatible", "anthropic"}
+    _SUPPORTED = {"openai-compatible", "anthropic", "codex"}
     if args.name not in _SUPPORTED:
         sys.stderr.write(
             f"error: provider {args.name!r} is not yet wired up. "

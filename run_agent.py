@@ -299,6 +299,68 @@ _ANTHROPIC_STOP_TO_OPENAI = {
 }
 
 
+# ── Codex Responses API normalization ───────────────────────────────────
+# Wave 5 light path: take whatever ``client.responses.create`` returned
+# and dress it up as an OpenAI ChatCompletion so the rest of the agent
+# loop is provider-agnostic.  ``_normalize_codex_response`` already does
+# 90% of the work — it produces an assistant_message SimpleNamespace
+# with .content / .tool_calls plus a finish_reason string; we just have
+# to wrap that in the .choices[0] container.
+
+def _codex_response_to_openai_shape(response: Any) -> Any:
+    """Wrap a Responses API output in the OpenAI ChatCompletion shape.
+
+    ``_normalize_codex_response`` extracts content_parts / reasoning /
+    function_call / custom_tool_call output items into a synthetic
+    assistant message and computes a finish_reason.  We promote it to
+    the ``.choices[0].message`` slot so ``run_conversation`` doesn't
+    have to know the difference.
+    """
+    from agent.codex_responses_adapter import _normalize_codex_response
+
+    assistant_message, finish_reason = _normalize_codex_response(response)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=assistant_message, finish_reason=finish_reason)],
+    )
+
+
+def _accumulate_codex_stream(
+    stream_ctx: Any,
+    callback: Callable[[str], None],
+) -> Any:
+    """Drain a Responses API stream, firing ``callback`` per text delta.
+
+    ``stream_ctx`` is the value returned from ``client.responses.stream(**kw)``
+    — a context manager that yields ``response.*`` events on iteration.
+    We forward ``response.output_text.delta`` events (the user-visible
+    answer tokens) to the callback live; reasoning / function_call /
+    output_item.done events are left to the SDK's
+    ``stream.get_final_response()`` which assembles the canonical
+    Response with all output items already populated.
+
+    Returns the same ``SimpleNamespace`` shape as the non-streaming path
+    so the run loop in ``run_conversation`` doesn't need to branch on
+    whether streaming was used.
+    """
+    with stream_ctx as stream:
+        for event in stream:
+            event_type = getattr(event, "type", "") or ""
+            # gpt-5 / o1 over native /v1/responses uses
+            # "response.output_text.delta"; some backends drop the prefix.
+            # Match either form.
+            if "output_text.delta" not in event_type:
+                continue
+            delta_text = getattr(event, "delta", "")
+            if not delta_text:
+                continue
+            try:
+                callback(delta_text)
+            except Exception:
+                logger.exception("codex stream callback failed; continuing accumulation")
+        final = stream.get_final_response()
+    return _codex_response_to_openai_shape(final)
+
+
 def _accumulate_anthropic_stream(
     stream_ctx: Any,
     callback: Callable[[str], None],
@@ -520,11 +582,17 @@ class AIAgent:
         ``provider`` overrides the auto-detection in
         ``_detect_provider``.  Pass it explicitly when you want to force
         a route (e.g. ``provider="anthropic"`` against an Anthropic-compatible
-        base_url).  The ``"anthropic"`` route is fully wired through
-        ``_call_anthropic_messages`` — non-streaming via ``messages.create``
-        (§2.4 wave 3) and event-based streaming via ``messages.stream``
-        (§2.4 wave 4).  ``"bedrock" / "codex" / "gemini"`` are still
-        advertised-only — those adapters remain unported.
+        base_url).  Wired routes:
+
+        - ``"openai-compatible"`` (default) — ``chat.completions.create``
+          with streaming.
+        - ``"anthropic"`` (§2.4 waves 3-4) — ``messages.create`` +
+          event-based ``messages.stream``.
+        - ``"codex"`` (§2.4 waves 5-6) — ``responses.create`` +
+          event-based ``responses.stream``.
+
+        ``"bedrock" / "gemini"`` are still advertised-only — those
+        adapters remain unported.
         """
         _install_safe_stdio()
 
@@ -970,6 +1038,7 @@ class AIAgent:
         """
         stream_callback: Optional[Callable[[str], None]] = self._stream_callback
         is_anthropic = self.provider == "anthropic"
+        is_codex = self.provider == "codex"
 
         attempt = 0
         last_exc: Optional[Exception] = None
@@ -978,6 +1047,8 @@ class AIAgent:
             try:
                 if is_anthropic:
                     return self._call_anthropic_messages(messages, tools, stream_callback)
+                if is_codex:
+                    return self._call_codex_responses(messages, tools, stream_callback)
                 client = self._get_openai_client()
                 api_kwargs: Dict[str, Any] = {
                     "model": self.model,
@@ -1045,6 +1116,72 @@ class AIAgent:
             return _anthropic_response_to_openai_shape(response)
         return _accumulate_anthropic_stream(
             client.messages.stream(**api_kwargs),
+            stream_callback,
+        )
+
+    def _call_codex_responses(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        stream_callback: Optional[Callable[[str], None]] = None,
+    ) -> Any:
+        """Send one ``responses.create`` round-trip (Codex / gpt-5 / o1).
+
+        The Responses API takes:
+          - ``instructions``: system prompt (extracted from messages[0])
+          - ``input``: the rest of the chat history converted via
+            ``_chat_messages_to_responses_input``
+          - ``tools``: function definitions converted via
+            ``_responses_tools``
+
+        When ``stream_callback`` is set, ``responses.stream(...)`` is used
+        instead and ``_accumulate_codex_stream`` forwards each
+        ``response.output_text.delta`` to the callback live before
+        assembling the final response via ``stream.get_final_response()``
+        (§2.4 wave 6).
+
+        Reasoning effort / encrypted multi-turn continuity / GitHub-Models
+        backend / xAI-Grok backend / Codex-OAuth backend are all left at
+        their defaults — those wirings come on demand.
+        """
+        from agent.codex_responses_adapter import (
+            _chat_messages_to_responses_input,
+            _responses_tools,
+        )
+
+        # Split system out of the messages array so it lands in
+        # ``instructions`` rather than as an input item.
+        instructions = ""
+        payload_messages = messages
+        if messages and messages[0].get("role") == "system":
+            instructions = str(messages[0].get("content") or "").strip()
+            payload_messages = messages[1:]
+        if not instructions:
+            from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+            instructions = DEFAULT_AGENT_IDENTITY
+
+        api_kwargs: Dict[str, Any] = {
+            "model": self.model,
+            "instructions": instructions,
+            "input": _chat_messages_to_responses_input(payload_messages),
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "store": False,
+        }
+        converted_tools = _responses_tools(tools) if tools else None
+        if converted_tools:
+            api_kwargs["tools"] = converted_tools
+        if self.max_tokens is not None:
+            # Responses API renamed max_tokens → max_output_tokens for
+            # consistency with Anthropic's naming.
+            api_kwargs["max_output_tokens"] = self.max_tokens
+
+        client = self._get_openai_client()
+        if stream_callback is None:
+            response = client.responses.create(**api_kwargs)
+            return _codex_response_to_openai_shape(response)
+        return _accumulate_codex_stream(
+            client.responses.stream(**api_kwargs),
             stream_callback,
         )
 

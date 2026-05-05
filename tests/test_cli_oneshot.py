@@ -297,11 +297,11 @@ def test_provider_test_pings_and_reports_ok(stub_openai, capsys):
 
 
 def test_provider_test_unknown_provider_rejects(monkeypatch, capsys):
-    """bedrock/codex/gemini are still rejected up front (wave 3 ships only anthropic)."""
+    """bedrock/gemini still rejected up front (codex landed in wave 5)."""
     monkeypatch.setenv("PHALANX_MODEL", "gpt-test")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
 
-    for unsupported in ("bedrock", "codex", "gemini"):
+    for unsupported in ("bedrock", "gemini"):
         rc = cli_main(["provider", "test", unsupported])
         captured = capsys.readouterr()
         assert rc == 2, f"{unsupported} should be rejected"
@@ -516,6 +516,166 @@ def test_accumulate_anthropic_stream_callback_failure_does_not_break_run(caplog)
 
     response = _accumulate_anthropic_stream(stream, bad_callback)
     assert response.choices[0].message.content == "AB"
+
+
+# ── §2.4 wave 5: codex (Responses API) routing ──────────────────────
+
+
+def test_codex_response_to_openai_shape_text_only():
+    """Pure-text Codex responses normalize to a single .choices[0]."""
+    from run_agent import _codex_response_to_openai_shape
+    from tests.conftest import make_codex_text_response
+
+    resp = _codex_response_to_openai_shape(make_codex_text_response("hello"))
+    assert resp.choices[0].message.content == "hello"
+    assert not resp.choices[0].message.tool_calls
+    assert resp.choices[0].finish_reason == "stop"
+
+
+def test_codex_response_to_openai_shape_function_call():
+    """function_call output items become OpenAI-shape tool_calls."""
+    from run_agent import _codex_response_to_openai_shape
+    from tests.conftest import make_codex_tool_response
+
+    raw = make_codex_tool_response([("call_abc", "echo", '{"text":"hi"}')])
+    resp = _codex_response_to_openai_shape(raw)
+    assert resp.choices[0].finish_reason == "tool_calls"
+    tcs = resp.choices[0].message.tool_calls
+    assert len(tcs) == 1
+    assert tcs[0].id == "call_abc"
+    assert tcs[0].function.name == "echo"
+    assert json.loads(tcs[0].function.arguments) == {"text": "hi"}
+
+
+def test_provider_test_codex_routes_through_responses_api(
+    stub_codex, capsys, monkeypatch,
+):
+    """`hermes provider test codex` exercises the wave-5 routing end-to-end."""
+    monkeypatch.setenv("PHALANX_MODEL", "gpt-5")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-x")
+    from tests.conftest import make_codex_text_response
+    stub = stub_codex([make_codex_text_response("pong")])
+
+    rc = cli_main(["provider", "test", "codex"])
+    captured = capsys.readouterr()
+
+    assert rc == 0
+    assert "OK" in captured.out
+    assert "pong" in captured.out
+    assert len(stub.calls) == 1
+    # Responses API shape: instructions + input + tool_choice/parallel/store keys
+    kwargs = stub.calls[0]
+    assert "instructions" in kwargs
+    assert isinstance(kwargs["input"], list)
+    assert kwargs["tool_choice"] == "auto"
+    assert kwargs["parallel_tool_calls"] is True
+    assert kwargs["store"] is False
+
+
+def test_oneshot_codex_provider_drives_full_flow(stub_codex, capsys):
+    """`oneshot --provider codex` runs the full run_conversation through codex."""
+    from tests.conftest import make_codex_text_response
+
+    stub = stub_codex([make_codex_text_response("hi from gpt-5")])
+    rc = cli_main([
+        "--model", "gpt-5",
+        "--api-key", "sk-x",
+        "--base-url", "https://api.openai.com/v1",
+        "--provider", "codex",
+        "oneshot", "say hi",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "hi from gpt-5" in captured.out
+    kwargs = stub.calls[0]
+    # System prompt was extracted into instructions, not left in input.
+    assert kwargs["instructions"]
+    # The remaining payload is the user turn (and any tool turns).
+    assert any(item.get("role") == "user" or item.get("type") == "message"
+               for item in kwargs["input"])
+
+
+def test_accumulate_codex_stream_forwards_text_deltas():
+    """response.output_text.delta events fire the callback in order."""
+    from run_agent import _accumulate_codex_stream
+    from tests.conftest import (
+        FakeCodexStream,
+        FakeCodexStreamEvent,
+        make_codex_text_delta_event,
+        make_codex_text_response,
+    )
+
+    events = [
+        FakeCodexStreamEvent("response.created"),
+        FakeCodexStreamEvent("response.output_item.added"),
+        make_codex_text_delta_event("hi "),
+        make_codex_text_delta_event("there"),
+        FakeCodexStreamEvent("response.output_item.done"),
+        FakeCodexStreamEvent("response.completed"),
+    ]
+    final = make_codex_text_response("hi there")
+    stream = FakeCodexStream(events, final)
+
+    seen: list = []
+    response = _accumulate_codex_stream(stream, seen.append)
+
+    assert seen == ["hi ", "there"]
+    assert response.choices[0].message.content == "hi there"
+    assert response.choices[0].finish_reason == "stop"
+
+
+def test_accumulate_codex_stream_callback_failure_does_not_break_run(caplog):
+    """A buggy stream callback is logged but get_final_response still wins."""
+    import logging
+    from run_agent import _accumulate_codex_stream
+    from tests.conftest import (
+        FakeCodexStream,
+        make_codex_text_delta_event,
+        make_codex_text_response,
+    )
+
+    caplog.set_level(logging.ERROR, logger="run_agent")
+    stream = FakeCodexStream(
+        [make_codex_text_delta_event("A"), make_codex_text_delta_event("B")],
+        make_codex_text_response("AB"),
+    )
+
+    def bad_callback(_d: str) -> None:
+        raise RuntimeError("ui crashed")
+
+    response = _accumulate_codex_stream(stream, bad_callback)
+    assert response.choices[0].message.content == "AB"
+
+
+def test_oneshot_codex_streaming_drives_real_stream(stub_codex, capsys):
+    """--stream on the codex route now drives responses.stream() for real."""
+    from tests.conftest import (
+        make_codex_text_delta_event,
+        make_codex_text_response,
+    )
+
+    events = [
+        make_codex_text_delta_event("hi "),
+        make_codex_text_delta_event("from "),
+        make_codex_text_delta_event("gpt-5"),
+    ]
+    final = make_codex_text_response("hi from gpt-5")
+    stub = stub_codex([(events, final)])
+
+    rc = cli_main([
+        "--model", "gpt-5",
+        "--api-key", "sk-x",
+        "--base-url", "https://api.openai.com/v1",
+        "--provider", "codex",
+        "oneshot", "--stream", "hi",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    # Streaming wrote the deltas to stdout in order, then a trailing newline.
+    assert captured.out == "hi from gpt-5\n"
+    # And we hit responses.stream(), not responses.create().
+    assert len(stub.stream_calls) == 1
+    assert len(stub.calls) == 0
 
 
 def test_oneshot_anthropic_streaming_drives_real_stream(stub_anthropic, capsys):

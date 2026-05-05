@@ -258,6 +258,172 @@ class _StubAnthropicMessages:
         return FakeAnthropicStream(events, final)
 
 
+# ── Codex Responses API stubs (§2.4 wave 5) ───────────────────────────
+
+
+class FakeCodexOutputItem:
+    """Stand-in for one item in a Responses API ``response.output[]`` array.
+
+    Just an attribute bag — ``_normalize_codex_response`` reads via getattr.
+    """
+
+    def __init__(self, type: str, **kwargs: Any) -> None:
+        self.type = type
+        self.role = kwargs.pop("role", None)
+        self.status = kwargs.pop("status", "completed")
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+class FakeCodexContentPart:
+    """One content part inside a `message` output item (output_text)."""
+
+    def __init__(self, text: str, type: str = "output_text") -> None:
+        self.type = type
+        self.text = text
+
+
+class FakeCodexResponse:
+    """Stand-in for ``responses.create(...)`` return value."""
+
+    def __init__(self, output: List[FakeCodexOutputItem], status: str = "completed",
+                 output_text: Optional[str] = None) -> None:
+        self.output = output
+        self.status = status
+        if output_text is not None:
+            self.output_text = output_text
+
+
+def make_codex_text_response(text: str) -> FakeCodexResponse:
+    """One-message response with a single output_text content part."""
+    return FakeCodexResponse(
+        [FakeCodexOutputItem(
+            "message", role="assistant", status="completed",
+            content=[FakeCodexContentPart(text)],
+        )],
+    )
+
+
+def make_codex_tool_response(tool_calls: Iterable[tuple]) -> FakeCodexResponse:
+    """Function-call output items; each tuple is (call_id, name, arguments_json)."""
+    items = []
+    for call_id, name, arguments in tool_calls:
+        items.append(FakeCodexOutputItem(
+            "function_call",
+            call_id=call_id,
+            name=name,
+            arguments=arguments,
+            id=None,
+        ))
+    return FakeCodexResponse(items)
+
+
+class FakeCodexStreamEvent:
+    """One iteration item from a fake `responses.stream(...)` context manager."""
+
+    def __init__(self, type: str, **kwargs: Any) -> None:
+        self.type = type
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+
+def make_codex_text_delta_event(text: str) -> FakeCodexStreamEvent:
+    """Sugar: build a `response.output_text.delta` event."""
+    return FakeCodexStreamEvent("response.output_text.delta", delta=text)
+
+
+class FakeCodexStream:
+    """Stand-in for the context manager returned by `responses.stream(**kw)`."""
+
+    def __init__(self, events: List[FakeCodexStreamEvent], final: FakeCodexResponse) -> None:
+        self._events = list(events)
+        self._final = final
+
+    def __enter__(self) -> "FakeCodexStream":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+    def __iter__(self):
+        return iter(self._events)
+
+    def get_final_response(self) -> FakeCodexResponse:
+        return self._final
+
+
+class StubCodexResponses:
+    """Stand-in for ``client.responses``.
+
+    Each entry of the queue is either a bare ``FakeCodexResponse`` (consumed
+    by ``create``) or a ``(events_list, final_response)`` tuple (consumed by
+    ``stream``).  Asserting on the shape catches mismatched setups.
+    """
+
+    def __init__(self, client: "StubCodexClient") -> None:
+        self._client = client
+
+    def create(self, **kwargs: Any) -> FakeCodexResponse:
+        self._client.calls.append(kwargs)
+        if not self._client._responses:
+            raise AssertionError("StubCodexClient ran out of queued responses")
+        nxt = self._client._responses.pop(0)
+        if not isinstance(nxt, FakeCodexResponse):
+            raise AssertionError(
+                "StubCodexClient.responses.create called but next queued "
+                "response is a streaming tuple (events, final). Use "
+                "responses.stream or queue a non-streaming response instead."
+            )
+        return nxt
+
+    def stream(self, **kwargs: Any) -> FakeCodexStream:
+        self._client.stream_calls.append(kwargs)
+        if not self._client._responses:
+            raise AssertionError("StubCodexClient ran out of queued responses")
+        nxt = self._client._responses.pop(0)
+        if not (isinstance(nxt, tuple) and len(nxt) == 2):
+            raise AssertionError(
+                "StubCodexClient.responses.stream called but next queued "
+                "response is not a (events, final) tuple."
+            )
+        events, final = nxt
+        return FakeCodexStream(events, final)
+
+
+class StubCodexClient:
+    """Stand-in for ``openai.OpenAI(...)`` with .responses wired."""
+
+    def __init__(self, responses: List[Any]) -> None:
+        self._responses = list(responses)
+        self.calls: List[dict] = []
+        self.stream_calls: List[dict] = []
+        self.responses = StubCodexResponses(self)
+        # Defensive: include `chat` so any leak into the openai-compatible
+        # path raises a clear error rather than AttributeError.
+        self.chat = None
+
+    def close(self) -> None:
+        pass
+
+
+@pytest.fixture
+def stub_codex(monkeypatch):
+    """Factory: ``stub_codex([resp1, ...])`` patches ``run_agent.OpenAI``.
+
+    Mirrors stub_openai but the returned client exposes ``.responses.create``
+    instead of ``.chat.completions.create`` so codex routing (which hits
+    ``client.responses.create``) drives the stub.
+    """
+    import run_agent
+
+    def factory(responses: List[FakeCodexResponse]) -> StubCodexClient:
+        client = StubCodexClient(responses)
+        monkeypatch.setattr(run_agent, "OpenAI", lambda *a, **kw: client)
+        return client
+
+    return factory
+
+
 @pytest.fixture
 def stub_anthropic(monkeypatch):
     """Factory: ``stub_anthropic([r1, r2, ...])`` patches ``build_anthropic_client``.
