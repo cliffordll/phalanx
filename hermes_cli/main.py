@@ -202,6 +202,36 @@ def _build_parser() -> argparse.ArgumentParser:
     p_price_est.set_defaults(func=cmd_pricing_estimate)
     p_price.set_defaults(func=cmd_pricing_help)
 
+    # session ----------------------------------------------------------
+    p_sess = sub.add_parser("session", help="list / inspect / dump / delete persisted sessions")
+    p_sess_sub = p_sess.add_subparsers(dest="session_cmd", metavar="<subcmd>")
+    p_sess_list = p_sess_sub.add_parser("list", help="list recent sessions")
+    p_sess_list.add_argument("--limit", type=int, default=20,
+                             help="max rows to print (default 20)")
+    p_sess_list.add_argument("--source", default=None,
+                             help="filter by source ('cli', 'gateway', ...)")
+    p_sess_list.add_argument("--json", action="store_true",
+                             help="emit JSON array instead of the table view")
+    p_sess_list.set_defaults(func=cmd_session_list)
+    p_sess_show = p_sess_sub.add_parser(
+        "show", help="render messages for a session (id or unique prefix)"
+    )
+    p_sess_show.add_argument("target", help="session id or unique prefix")
+    p_sess_show.set_defaults(func=cmd_session_show)
+    p_sess_dump = p_sess_sub.add_parser(
+        "dump", help="emit raw JSONL of all messages for a session"
+    )
+    p_sess_dump.add_argument("target", help="session id or unique prefix")
+    p_sess_dump.set_defaults(func=cmd_session_dump)
+    p_sess_del = p_sess_sub.add_parser(
+        "delete", help="delete a session and all its messages"
+    )
+    p_sess_del.add_argument("target", help="session id or unique prefix")
+    p_sess_del.add_argument("--yes", action="store_true",
+                            help="skip the confirmation prompt")
+    p_sess_del.set_defaults(func=cmd_session_delete)
+    p_sess.set_defaults(func=cmd_session_help)
+
     # version ----------------------------------------------------------
     p_ver = sub.add_parser("version", help="print phalanx version")
     p_ver.set_defaults(func=cmd_version)
@@ -872,6 +902,165 @@ def cmd_config_get(args: argparse.Namespace) -> int:
         print(json.dumps(value, ensure_ascii=False, indent=2))
     else:
         print(value)
+    return 0
+
+
+# ── session subcommand (Phase 2.5 wave 4) ──────────────────────────────
+
+
+def _format_session_age(timestamp: Optional[float]) -> str:
+    """Render a relative-age string like '3m ago' / '2h ago'."""
+    if not timestamp:
+        return "—"
+    import time
+    delta = time.time() - timestamp
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta / 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta / 3600)}h ago"
+    return f"{int(delta / 86400)}d ago"
+
+
+def cmd_session_help(args: argparse.Namespace) -> int:
+    print("usage: hermes session <list|show|dump|delete> ...")
+    return 0
+
+
+def cmd_session_list(args: argparse.Namespace) -> int:
+    """Print the most recent persisted sessions."""
+    from hermes_state import SessionDB
+    try:
+        db = SessionDB()
+    except Exception as exc:
+        sys.stderr.write(f"error: cannot open session DB: {exc}\n")
+        return 2
+    try:
+        rows = db.list_sessions_rich(
+            source=args.source, limit=args.limit, offset=0,
+        )
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("(no sessions persisted yet)")
+        return 0
+    # Compact human-readable table.  ID is shown as the first 8 chars
+    # so users can copy/paste into ``--resume``.
+    print(f"{'ID':10s} {'SOURCE':10s} {'MODEL':18s} {'MSGS':>5s}  "
+          f"{'LAST':10s}  PREVIEW")
+    for r in rows:
+        sid = (r.get("id") or "")[:8]
+        source = r.get("source") or "?"
+        model = (r.get("model") or "?")[:18]
+        msgs = r.get("message_count") or 0
+        last = _format_session_age(r.get("last_active"))
+        preview = r.get("preview") or ""
+        print(f"{sid:10s} {source:10s} {model:18s} {msgs:>5d}  "
+              f"{last:10s}  {preview}")
+    return 0
+
+
+def _resolve_session_target(target: str):
+    """Open SessionDB + resolve target id-or-prefix; exit(2) on failure."""
+    from hermes_state import SessionDB
+    try:
+        db = SessionDB()
+    except Exception as exc:
+        sys.stderr.write(f"error: cannot open session DB: {exc}\n")
+        sys.exit(2)
+    sid = db.resolve_session_id(target)
+    if not sid:
+        sys.stderr.write(
+            f"error: session {target!r} not found "
+            "(or prefix is ambiguous)\n"
+        )
+        db.close()
+        sys.exit(2)
+    return db, sid
+
+
+def cmd_session_show(args: argparse.Namespace) -> int:
+    """Pretty-print one session's metadata + messages."""
+    db, sid = _resolve_session_target(args.target)
+    try:
+        sess = db._get_session_rich_row(sid)
+        if sess is None:
+            sys.stderr.write(f"error: session {sid!r} disappeared\n")
+            return 2
+        msgs = db.get_messages(sid)
+    finally:
+        db.close()
+
+    print(f"id        : {sess['id']}")
+    print(f"source    : {sess.get('source')}")
+    print(f"model     : {sess.get('model')}")
+    print(f"started   : {sess.get('started_at')}")
+    print(f"ended     : {sess.get('ended_at')}  ({sess.get('end_reason') or '—'})")
+    print(f"messages  : {sess.get('message_count')}  "
+          f"(tool calls: {sess.get('tool_call_count')})")
+    print(f"tokens    : in={sess.get('input_tokens')} "
+          f"out={sess.get('output_tokens')} "
+          f"cache_r={sess.get('cache_read_tokens')} "
+          f"cache_w={sess.get('cache_write_tokens')} "
+          f"reasoning={sess.get('reasoning_tokens')}")
+    print(f"preview   : {sess.get('preview')}")
+    print()
+    for i, m in enumerate(msgs):
+        role = m.get("role") or "?"
+        content = m.get("content")
+        if isinstance(content, list):
+            content = json.dumps(content, ensure_ascii=False)
+        elif content is None:
+            content = ""
+        # Trim very long content for readability — full payload is in
+        # ``session dump``.
+        content_str = str(content)
+        if len(content_str) > 500:
+            content_str = content_str[:497] + "..."
+        print(f"--- [{i}] {role} ---")
+        if m.get("tool_name"):
+            print(f"  tool: {m['tool_name']}  call_id: {m.get('tool_call_id')}")
+        if m.get("tool_calls"):
+            print(f"  tool_calls: {json.dumps(m['tool_calls'], ensure_ascii=False)}")
+        if content_str:
+            print(content_str)
+    return 0
+
+
+def cmd_session_dump(args: argparse.Namespace) -> int:
+    """Emit each message as one JSON line on stdout."""
+    db, sid = _resolve_session_target(args.target)
+    try:
+        msgs = db.get_messages(sid)
+    finally:
+        db.close()
+    for m in msgs:
+        print(json.dumps(m, ensure_ascii=False, default=str))
+    return 0
+
+
+def cmd_session_delete(args: argparse.Namespace) -> int:
+    """Remove a session and all its messages."""
+    db, sid = _resolve_session_target(args.target)
+    if not args.yes:
+        sys.stderr.write(
+            f"about to delete session {sid!r} and all its messages.\n"
+            "pass --yes to confirm.\n"
+        )
+        db.close()
+        return 1
+    try:
+        deleted = db.delete_session(sid)
+    finally:
+        db.close()
+    if not deleted:
+        sys.stderr.write(f"error: session {sid!r} could not be deleted\n")
+        return 2
+    print(f"deleted session {sid}")
     return 0
 
 

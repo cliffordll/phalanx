@@ -707,6 +707,167 @@ class SessionDB:
         self._execute_write(_do)
 
     # =====================================================================
+    # Session listing / deletion (§2.5 wave 4)
+    # =====================================================================
+
+    def list_sessions_rich(
+        self,
+        source: Optional[str] = None,
+        exclude_sources: Optional[List[str]] = None,
+        limit: int = 20,
+        offset: int = 0,
+        include_children: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """List sessions with preview + last_active, ordered by start time.
+
+        Returns dicts with all ``sessions.*`` columns plus:
+
+        * ``preview`` — first 60 chars of the first user message (with
+          newlines flattened to spaces); empty string if the session
+          has no user message yet.
+        * ``last_active`` — most recent message timestamp, or
+          ``started_at`` if the session has no messages.
+
+        Phalanx omits the upstream ``order_by_last_active`` /
+        ``project_compression_tips`` paths — both depend on
+        compression-continuation chains that don't exist yet (§2.7
+        territory).  Default sort is ``started_at DESC`` with LIMIT/
+        OFFSET pagination.
+
+        ``include_children=False`` (default) hides sessions whose
+        parent was still alive when the child started — these are
+        sub-agent runs / compression continuations / branches that
+        a CLI user shouldn't see at the top level.  Branch children
+        (``parent.end_reason='branched'`` and ``child.started_at >=
+        parent.ended_at``) stay visible.
+        """
+        where_clauses: List[str] = []
+        params: List[Any] = []
+
+        if not include_children:
+            where_clauses.append(
+                "(s.parent_session_id IS NULL"
+                " OR EXISTS (SELECT 1 FROM sessions p"
+                "            WHERE p.id = s.parent_session_id"
+                "            AND p.end_reason = 'branched'"
+                "            AND s.started_at >= p.ended_at))"
+            )
+        if source:
+            where_clauses.append("s.source = ?")
+            params.append(source)
+        if exclude_sources:
+            placeholders = ",".join("?" for _ in exclude_sources)
+            where_clauses.append(f"s.source NOT IN ({placeholders})")
+            params.extend(exclude_sources)
+
+        where_sql = (
+            f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        )
+        query = f"""
+            SELECT s.*,
+                COALESCE(
+                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                     FROM messages m
+                     WHERE m.session_id = s.id AND m.role = 'user'
+                       AND m.content IS NOT NULL
+                     ORDER BY m.timestamp, m.id LIMIT 1),
+                    ''
+                ) AS _preview_raw,
+                COALESCE(
+                    (SELECT MAX(m2.timestamp) FROM messages m2
+                     WHERE m2.session_id = s.id),
+                    s.started_at
+                ) AS last_active
+            FROM sessions s
+            {where_sql}
+            ORDER BY s.started_at DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+
+        with self._lock:
+            cursor = self._conn.execute(query, params)
+            rows = cursor.fetchall()
+        sessions: List[Dict[str, Any]] = []
+        for row in rows:
+            s = dict(row)
+            raw = s.pop("_preview_raw", "").strip()
+            if raw:
+                text = raw[:60]
+                s["preview"] = text + ("..." if len(raw) > 60 else "")
+            else:
+                s["preview"] = ""
+            sessions.append(s)
+        return sessions
+
+    def _get_session_rich_row(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch one session with the same enriched columns as ``list_sessions_rich``.
+
+        Returns the row plus ``preview`` + ``last_active``, or ``None``
+        when the session doesn't exist.
+        """
+        query = """
+            SELECT s.*,
+                COALESCE(
+                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                     FROM messages m
+                     WHERE m.session_id = s.id AND m.role = 'user'
+                       AND m.content IS NOT NULL
+                     ORDER BY m.timestamp, m.id LIMIT 1),
+                    ''
+                ) AS _preview_raw,
+                COALESCE(
+                    (SELECT MAX(m2.timestamp) FROM messages m2
+                     WHERE m2.session_id = s.id),
+                    s.started_at
+                ) AS last_active
+            FROM sessions s
+            WHERE s.id = ?
+        """
+        with self._lock:
+            cursor = self._conn.execute(query, (session_id,))
+            row = cursor.fetchone()
+        if not row:
+            return None
+        s = dict(row)
+        raw = s.pop("_preview_raw", "").strip()
+        if raw:
+            text = raw[:60]
+            s["preview"] = text + ("..." if len(raw) > 60 else "")
+        else:
+            s["preview"] = ""
+        return s
+
+    def delete_session(self, session_id: str) -> bool:
+        """Delete a session and all its messages.
+
+        Child sessions are orphaned (``parent_session_id`` set to
+        NULL) rather than cascade-deleted so that, e.g., a compression
+        chain doesn't lose the live tip when an ancestor is pruned.
+        Returns True iff the session existed and was deleted.
+        """
+        def _do(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
+            )
+            if cursor.fetchone()[0] == 0:
+                return False
+            conn.execute(
+                "UPDATE sessions SET parent_session_id = NULL "
+                "WHERE parent_session_id = ?",
+                (session_id,),
+            )
+            conn.execute(
+                "DELETE FROM messages WHERE session_id = ?", (session_id,)
+            )
+            conn.execute(
+                "DELETE FROM sessions WHERE id = ?", (session_id,)
+            )
+            return True
+
+        return self._execute_write(_do)
+
+    # =====================================================================
     # Message storage
     # =====================================================================
 

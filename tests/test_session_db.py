@@ -540,6 +540,161 @@ def test_is_duplicate_replayed_user_message_false_for_different_content():
     ) is False
 
 
+# ── List / show / delete (wave 4) ────────────────────────────────────────
+
+
+def test_list_sessions_rich_returns_recent_first(stub_session_db):
+    """``started_at DESC`` — most recent session lands at row 0."""
+    stub_session_db.create_session("sess_old", source="cli")
+    time.sleep(0.01)
+    stub_session_db.create_session("sess_new", source="cli")
+    rows = stub_session_db.list_sessions_rich(limit=10)
+    assert [r["id"] for r in rows[:2]] == ["sess_new", "sess_old"]
+
+
+def test_list_sessions_rich_preview_first_user_message(stub_session_db):
+    stub_session_db.create_session("sess_p", source="cli")
+    stub_session_db.append_message(
+        "sess_p", "system", content="ignored for preview",
+    )
+    stub_session_db.append_message(
+        "sess_p", "user", content="first user msg here",
+    )
+    stub_session_db.append_message(
+        "sess_p", "user", content="second user msg",
+    )
+    [row] = stub_session_db.list_sessions_rich(limit=10)
+    assert row["preview"] == "first user msg here"
+
+
+def test_list_sessions_rich_preview_truncates_long_content(stub_session_db):
+    stub_session_db.create_session("sess_long", source="cli")
+    long_text = "x" * 500
+    stub_session_db.append_message("sess_long", "user", content=long_text)
+    [row] = stub_session_db.list_sessions_rich(limit=10)
+    assert row["preview"].endswith("...")
+    assert len(row["preview"]) == 63
+
+
+def test_list_sessions_rich_preview_flattens_newlines(stub_session_db):
+    stub_session_db.create_session("sess_nl", source="cli")
+    stub_session_db.append_message(
+        "sess_nl", "user", content="line one\nline two\rline three",
+    )
+    [row] = stub_session_db.list_sessions_rich(limit=10)
+    assert "\n" not in row["preview"]
+    assert "\r" not in row["preview"]
+    assert "line one line two line three" in row["preview"]
+
+
+def test_list_sessions_rich_last_active_uses_message_timestamp(
+    stub_session_db,
+):
+    stub_session_db.create_session("sess_la", source="cli")
+    stub_session_db.append_message("sess_la", "user", content="ping")
+    [row] = stub_session_db.list_sessions_rich(limit=10)
+    assert row["last_active"] >= row["started_at"]
+
+
+def test_list_sessions_rich_filters_by_source(stub_session_db):
+    stub_session_db.create_session("sess_a", source="cli")
+    stub_session_db.create_session("sess_b", source="gateway")
+    rows = stub_session_db.list_sessions_rich(source="gateway", limit=10)
+    assert [r["id"] for r in rows] == ["sess_b"]
+
+
+def test_list_sessions_rich_excludes_subagent_children_by_default(
+    stub_session_db,
+):
+    """Sub-agent runs (parent still alive) shouldn't surface at top level."""
+    stub_session_db.create_session("sess_parent", source="cli")
+    # Child started while parent is still alive — sub-agent shape.
+    stub_session_db.create_session(
+        "sess_subagent", source="cli", parent_session_id="sess_parent",
+    )
+    rows = stub_session_db.list_sessions_rich(limit=10)
+    ids = [r["id"] for r in rows]
+    assert "sess_parent" in ids
+    assert "sess_subagent" not in ids
+
+
+def test_list_sessions_rich_includes_branch_children(stub_session_db):
+    """``end_reason='branched'`` siblings stay visible."""
+    stub_session_db.create_session("sess_root", source="cli")
+    stub_session_db.end_session("sess_root", end_reason="branched")
+    # Branch child must start at-or-after the parent's ended_at.
+    parent_ended_at = stub_session_db.get_session("sess_root")["ended_at"]
+    stub_session_db._conn.execute(
+        "INSERT INTO sessions (id, source, parent_session_id, started_at) "
+        "VALUES (?, ?, ?, ?)",
+        ("sess_branch", "cli", "sess_root", parent_ended_at + 1),
+    )
+    stub_session_db._conn.commit()
+    rows = stub_session_db.list_sessions_rich(limit=10)
+    ids = {r["id"] for r in rows}
+    assert "sess_branch" in ids
+
+
+def test_list_sessions_rich_include_children_shows_all(stub_session_db):
+    stub_session_db.create_session("sess_p", source="cli")
+    stub_session_db.create_session(
+        "sess_c", source="cli", parent_session_id="sess_p",
+    )
+    rows = stub_session_db.list_sessions_rich(
+        limit=10, include_children=True,
+    )
+    ids = {r["id"] for r in rows}
+    assert ids == {"sess_p", "sess_c"}
+
+
+def test_list_sessions_rich_pagination(stub_session_db):
+    for i in range(5):
+        stub_session_db.create_session(f"sess_{i}", source="cli")
+    page1 = stub_session_db.list_sessions_rich(limit=2, offset=0)
+    page2 = stub_session_db.list_sessions_rich(limit=2, offset=2)
+    assert len(page1) == 2
+    assert len(page2) == 2
+    assert {r["id"] for r in page1}.isdisjoint({r["id"] for r in page2})
+
+
+def test_get_session_rich_row_includes_preview_and_last_active(
+    stub_session_db,
+):
+    stub_session_db.create_session("sess_r", source="cli")
+    stub_session_db.append_message("sess_r", "user", content="payload")
+    row = stub_session_db._get_session_rich_row("sess_r")
+    assert row is not None
+    assert row["preview"] == "payload"
+    assert row["last_active"] >= row["started_at"]
+
+
+def test_get_session_rich_row_missing_returns_none(stub_session_db):
+    assert stub_session_db._get_session_rich_row("does-not-exist") is None
+
+
+def test_delete_session_removes_session_and_messages(stub_session_db):
+    stub_session_db.create_session("sess_del", source="cli")
+    stub_session_db.append_message("sess_del", "user", content="hi")
+    assert stub_session_db.delete_session("sess_del") is True
+    assert stub_session_db.get_session("sess_del") is None
+    assert stub_session_db.get_messages("sess_del") == []
+
+
+def test_delete_session_orphans_children(stub_session_db):
+    stub_session_db.create_session("sess_p", source="cli")
+    stub_session_db.create_session(
+        "sess_c", source="cli", parent_session_id="sess_p",
+    )
+    stub_session_db.delete_session("sess_p")
+    child = stub_session_db.get_session("sess_c")
+    assert child is not None
+    assert child["parent_session_id"] is None
+
+
+def test_delete_session_returns_false_for_missing(stub_session_db):
+    assert stub_session_db.delete_session("does-not-exist") is False
+
+
 def test_is_duplicate_replayed_ignores_non_user_role():
     assert SessionDB._is_duplicate_replayed_user_message(
         [], {"role": "assistant", "content": "x"}
