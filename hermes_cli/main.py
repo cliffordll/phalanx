@@ -90,6 +90,8 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="max tokens for the model response")
     p_one.add_argument("--dump-messages", action="store_true",
                        help="after replying, print the full messages array as JSON to stderr")
+    p_one.add_argument("--dump-tools", action="store_true",
+                       help="after replying, print the tools schema array as JSON to stderr")
     p_one.set_defaults(func=cmd_oneshot)
 
     # chat -------------------------------------------------------------
@@ -280,6 +282,16 @@ def cmd_oneshot(args: argparse.Namespace) -> int:
             f"\n[done] turns={result['api_calls']} stop={result['stop_reason']} "
             f"budget={result['iterations_used']}/{agent.max_iterations}\n"
         )
+    if getattr(args, "dump_tools", False):
+        # Tool schemas are not part of the messages array — they're sent
+        # to the model via the OpenAI `tools=[...]` parameter.  Resolve
+        # them through the same path run_conversation uses, so the dump
+        # reflects what the model actually saw on this call.
+        sys.stderr.write("\n--- tools ---\n")
+        sys.stderr.write(json.dumps(
+            agent._resolve_tool_schemas(), ensure_ascii=False, indent=2,
+        ))
+        sys.stderr.write("\n")
     if getattr(args, "dump_messages", False):
         # Goes to stderr so it doesn't pollute the captured final_response;
         # callers who pipe stdout into another tool still see the dump

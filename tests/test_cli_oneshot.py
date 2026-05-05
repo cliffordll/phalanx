@@ -7,6 +7,8 @@ be reached by ``monkeypatch``).
 
 from __future__ import annotations
 
+import json
+
 from hermes_cli.main import main as cli_main
 from tests.conftest import make_text_response, make_tool_response
 
@@ -134,3 +136,55 @@ def test_oneshot_debug_prints_loop_summary_to_stderr(stub_openai, capsys):
     assert "ok" in captured.out
     assert "[done]" in captured.err
     assert "turns=" in captured.err
+
+
+def test_oneshot_dump_messages(stub_openai, capsys):
+    stub_openai([make_text_response("hi")])
+    rc = cli_main([
+        "--model", "gpt-test", "--api-key", "sk-x", "--base-url", "https://x/v1",
+        "oneshot", "--dump-messages", "ping",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip() == "hi"
+    assert "--- messages ---" in captured.err
+    # Pull the JSON section out of stderr; it's a list of role-tagged dicts.
+    body = captured.err.split("--- messages ---", 1)[1]
+    payload = json.loads(body.strip())
+    roles = [m["role"] for m in payload]
+    assert roles == ["system", "user", "assistant"]
+    # tools schema must NOT leak into messages dump.
+    assert "tools" not in captured.err.split("--- messages ---")[0]
+
+
+def test_oneshot_dump_tools(stub_openai, capsys):
+    stub_openai([make_text_response("hi")])
+    rc = cli_main([
+        "--model", "gpt-test", "--api-key", "sk-x", "--base-url", "https://x/v1",
+        "oneshot", "--dump-tools", "ping",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip() == "hi"
+    assert "--- tools ---" in captured.err
+    # Body is a JSON list of OpenAI function-calling tool schemas.
+    body = captured.err.split("--- tools ---", 1)[1]
+    payload = json.loads(body.strip())
+    assert isinstance(payload, list) and payload, "expected at least one tool schema"
+    # echo is always registered → must appear.
+    names = {entry["function"]["name"] for entry in payload}
+    assert "echo" in names
+
+
+def test_oneshot_dump_tools_and_messages_independent(stub_openai, capsys):
+    stub_openai([make_text_response("hi")])
+    rc = cli_main([
+        "--model", "gpt-test", "--api-key", "sk-x", "--base-url", "https://x/v1",
+        "oneshot", "--dump-tools", "--dump-messages", "ping",
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    # Both blocks present, in the order: tools first, then messages.
+    tools_idx = captured.err.find("--- tools ---")
+    msgs_idx = captured.err.find("--- messages ---")
+    assert tools_idx >= 0 and msgs_idx > tools_idx
