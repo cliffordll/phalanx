@@ -1,0 +1,38 @@
+.DS_Store
+/venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# Env / secrets
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+phalanx.egg-info/
+hermes_agent.egg-info/
+
+# Runtime data
+logs/
+data/
+tmp/
+.worktrees/
+
+# Private keys
+*.ppk
+*.pem
