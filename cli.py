@@ -180,6 +180,89 @@ def _run_oneshot(agent, query: str, *, verbose: bool) -> int:
 
 _EXIT_TOKENS = ("/exit", "/quit", ":q")
 
+# Sentinel returned by slash handlers that want the REPL to terminate.
+# Anything else (None / str / int) keeps the loop running.
+_DISPATCH_EXIT = "__exit__"
+
+
+def _cmd_help(args: str, state: dict) -> Optional[str]:
+    """Render registered commands grouped by category.
+
+    Active commands appear plainly; ``stub=True`` entries get a
+    "[stub]" tag so users know they're complete-able but not wired
+    up yet.  Aliases are inlined in parentheses on the canonical row
+    rather than getting their own line.
+    """
+    from hermes_cli.commands import COMMAND_REGISTRY
+
+    by_cat: dict[str, list] = {}
+    for cmd in COMMAND_REGISTRY:
+        by_cat.setdefault(cmd.category, []).append(cmd)
+
+    print("Available slash commands:\n")
+    for category in ("Session", "Configuration", "Tools", "Info", "Exit"):
+        cmds = by_cat.get(category)
+        if not cmds:
+            continue
+        print(f"  [{category}]")
+        for cmd in cmds:
+            label = f"/{cmd.name}"
+            if cmd.aliases:
+                label += " (" + ", ".join(f"/{a}" for a in cmd.aliases) + ")"
+            tag = " [stub]" if cmd.stub else ""
+            hint = f" {cmd.args_hint}" if cmd.args_hint else ""
+            print(f"    {label}{hint}  — {cmd.description}{tag}")
+        print()
+    return None
+
+
+def _cmd_exit(args: str, state: dict) -> str:
+    return _DISPATCH_EXIT
+
+
+def _cmd_stub(name: str) -> Any:
+    """Return a handler that prints 'not yet implemented' for *name*."""
+    def _h(args: str, state: dict) -> None:
+        print(f"/{name}: not yet implemented in phalanx (Phase 2.6 wave 3+)")
+        return None
+    return _h
+
+
+# Dispatch table — wave 2 wires only ``/help`` and the exit aliases.
+# Real handlers for ``/new`` / ``/clear`` / ``/history`` / ``/model`` /
+# ``/tools`` / ``/debug`` / ``/save`` / ``/resume`` land in wave 3 by
+# replacing entries here.
+_SLASH_HANDLERS: dict[str, Any] = {
+    "help":  _cmd_help,
+    "quit":  _cmd_exit,
+    "exit":  _cmd_exit,
+}
+
+
+def _dispatch_slash(line: str, state: dict) -> Optional[str]:
+    """Route a ``/<cmd> <args>`` line to the right handler.
+
+    * Resolves aliases via :func:`hermes_cli.commands.resolve_command`
+      so ``/reset`` and ``/new`` both reach the same handler.
+    * Unknown commands print a helpful "not registered" line.
+    * Registered-but-not-yet-wired commands print the stub message
+      from :func:`_cmd_stub`.
+    * Returns :data:`_DISPATCH_EXIT` only when the handler asks for
+      the REPL loop to terminate (``/exit`` / ``/quit``).
+    """
+    from hermes_cli.commands import resolve_command
+
+    head, _, args = line[1:].partition(" ")
+    cmd = resolve_command(head)
+    if cmd is None:
+        print(f"unknown command: /{head} (type /help for the list)")
+        return None
+    handler = _SLASH_HANDLERS.get(cmd.name)
+    if handler is None:
+        # Registered but no handler yet — wave-2 stub.
+        return _cmd_stub(cmd.name)(args, state)
+    return handler(args, state)
+
 
 def _history_path() -> Optional[Path]:
     """Resolve the persistent CLI history file path under PHALANX_HOME.
@@ -203,8 +286,9 @@ def _build_prompt_session() -> "PromptSession[str]":
 
     ``Alt+Enter`` inserts a newline (multiline input); plain ``Enter``
     submits — this is prompt_toolkit's default for ``multiline=False``
-    plus a key binding that injects a newline literal.  Slash-command
-    completion lands in wave 2; this wave wires the session shell.
+    plus a key binding that injects a newline literal.  Tab-completes
+    slash commands and their subcommands via
+    :class:`hermes_cli.commands.SlashCommandCompleter` (wave 2).
     """
     history_obj = None
     history_path = _history_path()
@@ -220,12 +304,22 @@ def _build_prompt_session() -> "PromptSession[str]":
     def _newline(event):
         event.app.current_buffer.insert_text("\n")
 
+    # Lazy import — keeps this module loadable when prompt_toolkit
+    # itself is missing (the fallback path stays available).
+    try:
+        from hermes_cli.commands import SlashCommandCompleter
+        completer: Optional[Any] = SlashCommandCompleter()
+    except Exception as exc:
+        logger.debug("slash completer unavailable: %s", exc)
+        completer = None
+
     return PromptSession(
         history=history_obj,
         auto_suggest=AutoSuggestFromHistory() if history_obj else None,
         key_bindings=bindings,
         enable_history_search=True,
-        complete_while_typing=False,
+        complete_while_typing=True if completer else False,
+        completer=completer,
     )
 
 
@@ -240,6 +334,7 @@ def _run_repl(agent) -> int:
     """
     print(f"phalanx chat (model={agent.model}).  Ctrl-D / Ctrl-C / /exit to quit.")
     history: List[Dict[str, Any]] = []
+    state: Dict[str, Any] = {"agent": agent}
 
     if _PT_AVAILABLE:
         session = _build_prompt_session()
@@ -258,8 +353,13 @@ def _run_repl(agent) -> int:
             return 0
         if not line:
             continue
-        if line in _EXIT_TOKENS:
-            return 0
+        if line.startswith("/") or line in _EXIT_TOKENS:
+            # ``:q`` is a vim-ism — keep the legacy alias mapped to /exit.
+            cmd_line = "/exit" if line == ":q" else line
+            outcome = _dispatch_slash(cmd_line, state)
+            if outcome == _DISPATCH_EXIT:
+                return 0
+            continue
         try:
             result = agent.run_conversation(line, conversation_history=history)
         except Exception as exc:
