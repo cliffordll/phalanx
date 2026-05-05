@@ -383,15 +383,8 @@ class ToolRegistry:
             return entry.max_result_size_chars
         if default is not None:
             return default
-        # tools/budget_config.py arrives in a later phase; until then use
-        # a conservative inline default (~64 KB).  The constant name
-        # matches upstream so a future cherry-pick of budget_config drops
-        # in cleanly.
-        try:
-            from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS  # type: ignore[import-not-found]
-            return DEFAULT_RESULT_SIZE_CHARS
-        except ImportError:
-            return 64 * 1024
+        from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS
+        return DEFAULT_RESULT_SIZE_CHARS
 
     def get_all_tool_names(self) -> List[str]:
         """Return sorted list of all registered tool names."""

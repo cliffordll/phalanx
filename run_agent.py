@@ -279,6 +279,15 @@ class AIAgent:
         # Cached schemas — built lazily, invalidated by switch_tools().
         self._tool_schemas_cache: Optional[List[Dict[str, Any]]] = None
 
+        # Per-session TodoStore — Phase 2.2 wave 2.  Plumbed into
+        # ``dispatch(name, args, store=...)`` so the ``todo`` tool can
+        # read/write across iterations within this conversation.
+        try:
+            from tools.todo_tool import TodoStore
+            self._todo_store = TodoStore()
+        except Exception:
+            self._todo_store = None
+
     # ── small helpers ────────────────────────────────────────────────
 
     def _safe_print(self, *args, **kwargs) -> None:
@@ -385,10 +394,26 @@ class AIAgent:
         if not callable(dispatch):
             return f"[error] tools.registry has no dispatch(); cannot run {tool_name!r}"
         try:
-            return dispatch(tool_name, arguments)
+            return dispatch(tool_name, arguments, store=self._todo_store)
         except Exception as exc:
             logger.exception("tool %s failed", tool_name)
             return f"[error] tool {tool_name} raised {type(exc).__name__}: {exc}"
+
+    def _get_active_terminal_env(self):
+        """Return the active LocalTerminalEnv for this task, or None.
+
+        Used by tool_result_storage to spill oversized results into the
+        sandbox via env.execute(...).  When no terminal env has been
+        created yet (no file/terminal tool has run), returns None and
+        the storage layer falls back to inline truncation.
+        """
+        try:
+            from tools.terminal_tool import _active_environments, _env_lock
+        except Exception:
+            return None
+        task_id = self._current_task_id or "default"
+        with _env_lock:
+            return _active_environments.get(task_id)
 
     @staticmethod
     def _parse_tool_arguments(raw: Any) -> Dict[str, Any]:
@@ -575,19 +600,37 @@ class AIAgent:
                 break
 
             # Dispatch each tool call sequentially (parallel exec arrives in Phase 7+).
+            from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
             for tc in serialized_calls:
                 fn = tc["function"]
                 name = fn["name"]
                 args = self._parse_tool_arguments(fn["arguments"])
                 self._vprint(f"[loop]   tool: {name}({list(args.keys())})")
                 result = self._dispatch_tool_call(name, args)
+                result_str = result if isinstance(result, str) else str(result)
+                # Layer 2: per-result persistence — spill oversized results
+                # into the sandbox temp dir so the model still sees a
+                # preview + path reference instead of consuming context.
+                result_str = maybe_persist_tool_result(
+                    content=result_str,
+                    tool_name=name,
+                    tool_use_id=tc["id"],
+                    env=self._get_active_terminal_env(),
+                )
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
-                    "content": result if isinstance(result, str) else str(result),
+                    "content": result_str,
                 })
                 if self.tool_delay:
                     time.sleep(self.tool_delay)
+
+            # Layer 3: aggregate per-turn budget — if the combined size of
+            # this round's tool results still exceeds MAX_TURN_BUDGET_CHARS,
+            # spill the largest non-persisted ones until under budget.
+            if serialized_calls:
+                turn_msgs = messages[-len(serialized_calls):]
+                enforce_turn_budget(turn_msgs, env=self._get_active_terminal_env())
 
         else:
             # Loop exhausted max_iterations cleanly.

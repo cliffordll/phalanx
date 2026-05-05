@@ -250,8 +250,10 @@ python run_agent.py --message "echo X"                           # 底层入口�
 ```bash
 python -m hermes_cli tools list --verbose                         # 显示 schema/描述
 python -m hermes_cli tools run read_file --args '{"path":"..."}'
+python -m hermes_cli tools run read_file --args '{"path":"D:\\opendemo\\claudedemo\\phalanx\\docs\\ARCHITECTURE.md"}'
 python -m hermes_cli tools run terminal --args '{"cmd":"ls"}'
 python -m hermes_cli tools run web_fetch --args '{"url":"..."}'
+python -m hermes_cli tools run web_fetch --args '{"url":"https://www.baidu.com/"}'
 python -m hermes_cli tools schema <name>                          # 单独 dump JSON Schema
 python -m hermes_cli tools dry-run <name> --args '...'            # 仅校验参数不真执行
 ```

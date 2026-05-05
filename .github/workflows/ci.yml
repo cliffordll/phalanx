@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Allow manual trigger from the Actions tab for ad-hoc runs (e.g.
+  # re-run on current main without a code change, or test workflow
+  # edits before merging).
+  workflow_dispatch:
 
 # Cancel in-progress runs for the same ref when a new commit lands —
 # avoids wasted minutes on superseded commits.

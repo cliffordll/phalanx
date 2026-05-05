@@ -27,7 +27,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from hermes_cli import __version__, __release_date__
 from hermes_cli.config import cfg_get, load_config
@@ -295,7 +295,17 @@ def cmd_tools_run(args: argparse.Namespace) -> int:
     if not isinstance(parsed_args, dict):
         sys.stderr.write("error: --args must decode to a JSON object\n")
         return 2
-    result = dispatch(args.name, parsed_args)
+    # Some tools (e.g. todo) require a per-session store that the agent
+    # would normally own.  When invoked via `tools run` there is no
+    # AIAgent, so spin up an ephemeral store local to this process.
+    extra_kwargs: Dict[str, Any] = {}
+    if args.name == "todo":
+        try:
+            from tools.todo_tool import TodoStore
+            extra_kwargs["store"] = TodoStore()
+        except Exception:
+            pass
+    result = dispatch(args.name, parsed_args, **extra_kwargs)
     if isinstance(result, str):
         print(result)
     else:
