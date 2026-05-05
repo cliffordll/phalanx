@@ -82,3 +82,92 @@ def test_tools_run_unknown_tool_returns_error_payload(capsys):
     payload = json.loads(captured.out.strip())
     assert "error" in payload
     assert "Unknown tool" in payload["error"]
+
+
+# ── tools schema ────────────────────────────────────────────────────
+
+
+def test_tools_schema_dumps_echo(capsys):
+    rc = cli_main(["tools", "schema", "echo"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    schema = json.loads(captured.out.strip())
+    assert schema["name"] == "echo"
+    assert schema["parameters"]["required"] == ["text"]
+    assert "text" in schema["parameters"]["properties"]
+
+
+def test_tools_schema_unknown_tool_exits_two(capsys):
+    rc = cli_main(["tools", "schema", "no_such_tool"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "unknown tool" in captured.err
+
+
+# ── tools dry-run ───────────────────────────────────────────────────
+
+
+def test_tools_dry_run_valid_args(capsys):
+    rc = cli_main([
+        "tools", "dry-run", "echo",
+        "--args", '{"text": "hi"}',
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    payload = json.loads(captured.out.strip())
+    assert payload["valid"] is True
+    assert payload["tool"] == "echo"
+    assert payload["args"] == {"text": "hi"}
+
+
+def test_tools_dry_run_missing_required_field(capsys):
+    rc = cli_main([
+        "tools", "dry-run", "echo",
+        "--args", '{"uppercase": true}',
+    ])
+    captured = capsys.readouterr()
+    assert rc == 1
+    payload = json.loads(captured.out.strip())
+    assert payload["valid"] is False
+    assert any("'text'" in err["message"] for err in payload["errors"])
+
+
+def test_tools_dry_run_wrong_type(capsys):
+    rc = cli_main([
+        "tools", "dry-run", "echo",
+        "--args", '{"text": 42}',
+    ])
+    captured = capsys.readouterr()
+    assert rc == 1
+    payload = json.loads(captured.out.strip())
+    assert payload["valid"] is False
+    err = next(e for e in payload["errors"] if e["path"] == "text")
+    assert "string" in err["message"]
+
+
+def test_tools_dry_run_invalid_json_exits_two(capsys):
+    rc = cli_main(["tools", "dry-run", "echo", "--args", "not-json"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "must be valid JSON" in captured.err
+
+
+def test_tools_dry_run_unknown_tool_exits_two(capsys):
+    rc = cli_main(["tools", "dry-run", "no_such_tool", "--args", "{}"])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "unknown tool" in captured.err
+
+
+def test_tools_dry_run_does_not_invoke_handler(monkeypatch, tmp_path, capsys):
+    """write_file dry-run must NOT actually create the file."""
+    target = tmp_path / "should_not_exist.txt"
+    rc = cli_main([
+        "tools", "dry-run", "write_file",
+        "--args", json.dumps({"path": str(target), "content": "hi"}),
+    ])
+    captured = capsys.readouterr()
+    assert rc == 0
+    payload = json.loads(captured.out.strip())
+    assert payload["valid"] is True
+    assert not target.exists(), "dry-run produced a side effect"

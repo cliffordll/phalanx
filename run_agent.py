@@ -153,6 +153,36 @@ class IterationBudget:
             return max(0, self.max_total - self._used)
 
 
+# ── Concurrent-tool gating ──────────────────────────────────────────────
+# These three sets steer ``_should_parallelize_tool_batch``.  Upstream
+# populates them with read-only tools, path-scoped editors, and tools that
+# must always run sequentially (e.g. ``terminal``).  phalanx leaves them
+# empty so the gate ALWAYS returns False and every batch falls through to
+# the sequential path — correct behavior until Phase 7+ wires up the
+# concurrent executor.  Names match upstream so a future cherry-pick can
+# fill them in without changing call sites.
+_NEVER_PARALLEL_TOOLS: set = set()
+_PARALLEL_SAFE_TOOLS: set = set()
+_PATH_SCOPED_TOOLS: set = set()
+
+
+def _should_parallelize_tool_batch(tool_calls) -> bool:
+    """Return True when a tool-call batch is safe to run concurrently.
+
+    Phalanx Phase 2.x stand-in: signature mirrors upstream's path-overlap
+    aware check, but with empty allow-lists the function reduces to
+    "always False".  ``_execute_tool_calls`` therefore always picks the
+    sequential path.  When upstream's full implementation lands the
+    function body can be replaced verbatim — call sites already match.
+    """
+    if not tool_calls or len(tool_calls) <= 1:
+        return False
+    tool_names = [getattr(tc.function, "name", "") for tc in tool_calls]
+    if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
+        return False
+    return all(name in _PARALLEL_SAFE_TOOLS for name in tool_names)
+
+
 # ── Tool registry plumbing ──────────────────────────────────────────────
 # Phase 2.1.4 will provide tools.registry.  Until then ``_load_tool_registry``
 # returns None and the agent runs in tool-less mode (still a valid loop).
@@ -415,6 +445,178 @@ class AIAgent:
         with _env_lock:
             return _active_environments.get(task_id)
 
+    # ── tool-execution subsystem ────────────────────────────────────
+    # Three-layer dispatch matching upstream's structure:
+    #   _execute_tool_calls         — entry; picks sequential vs concurrent
+    #   _execute_tool_calls_sequential / _concurrent — actual execution
+    #   _invoke_tool                — single-tool branch table
+    # phalanx Phase-2.x only implements the sequential path; the rest are
+    # signature-compatible stand-ins so future cherry-picks of upstream's
+    # plugins / guardrails / parallel executor drop in cleanly.
+
+    def _execute_tool_calls(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+    ) -> None:
+        """Execute a tool-call batch and append results to *messages*.
+
+        Decides between sequential and concurrent execution.  Currently
+        every batch falls through to sequential because
+        ``_should_parallelize_tool_batch`` returns False until phalanx
+        ports the parallel executor.
+        """
+        tool_calls = list(getattr(assistant_message, "tool_calls", None) or [])
+        if not tool_calls:
+            return
+        if not _should_parallelize_tool_batch(tool_calls):
+            return self._execute_tool_calls_sequential(
+                assistant_message, messages, effective_task_id, api_call_count
+            )
+        return self._execute_tool_calls_concurrent(
+            assistant_message, messages, effective_task_id, api_call_count
+        )
+
+    def _execute_tool_calls_concurrent(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+    ) -> None:
+        """Phalanx Phase-2.x stand-in: defer to sequential execution.
+
+        Upstream uses a thread pool with shared session_id / interrupt /
+        approval-queue state.  Until §2.4+ ports that machinery, this
+        method exists only so call sites match upstream — it forwards to
+        the sequential path.
+        """
+        logger.debug("phalanx: concurrent tool exec not yet wired; using sequential")
+        return self._execute_tool_calls_sequential(
+            assistant_message, messages, effective_task_id, api_call_count
+        )
+
+    def _execute_tool_calls_sequential(
+        self,
+        assistant_message,
+        messages: list,
+        effective_task_id: str,
+        api_call_count: int = 0,
+    ) -> None:
+        """Sequential execution: dispatch each tool, persist oversized
+        results (layer 2), enforce per-turn aggregate budget (layer 3).
+        """
+        from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
+
+        tool_calls = list(getattr(assistant_message, "tool_calls", None) or [])
+        if not tool_calls:
+            return
+        first_appended = len(messages)
+
+        for tool_call in tool_calls:
+            if self._interrupt_requested:
+                # Mirror upstream: skip remaining tools and emit a
+                # cancellation tool message for each so the API sees
+                # a complete tool-result sequence per protocol.
+                idx = tool_calls.index(tool_call)
+                for skipped in tool_calls[idx:]:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": skipped.id,
+                        "content": (
+                            f"[Tool execution cancelled — {skipped.function.name} "
+                            "was skipped due to user interrupt]"
+                        ),
+                    })
+                break
+
+            function_name = tool_call.function.name
+            try:
+                function_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError as exc:
+                logger.warning("Could not parse args for %s: %s", function_name, exc)
+                function_args = {}
+            if not isinstance(function_args, dict):
+                function_args = {}
+
+            self._vprint(f"[loop]   tool: {function_name}({list(function_args.keys())})")
+
+            result_str = self._invoke_tool(
+                function_name,
+                function_args,
+                effective_task_id,
+                tool_call_id=tool_call.id,
+                messages=messages,
+            )
+            if not isinstance(result_str, str):
+                result_str = str(result_str)
+
+            # Layer 2: per-result persistence — spill oversized results
+            # into the sandbox temp dir so the model only sees a preview
+            # + file-path reference instead of burning context.
+            result_str = maybe_persist_tool_result(
+                content=result_str,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                env=self._get_active_terminal_env(),
+            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result_str,
+            })
+            if self.tool_delay:
+                time.sleep(self.tool_delay)
+
+        # Layer 3: aggregate per-turn budget — if the combined size of
+        # this round's tool results still exceeds the turn budget, spill
+        # the largest non-persisted ones until under budget.
+        enforce_turn_budget(messages[first_appended:], env=self._get_active_terminal_env())
+
+    def _invoke_tool(
+        self,
+        function_name: str,
+        function_args: dict,
+        effective_task_id: str,
+        tool_call_id: Optional[str] = None,
+        messages: Optional[list] = None,
+        pre_tool_block_checked: bool = False,
+    ) -> str:
+        """Single-tool dispatch branch table.
+
+        Mirrors upstream's structure slot-for-slot.  phalanx currently
+        implements only the ``todo`` branch (state plumbed via
+        ``self._todo_store``) and the registry catch-all; other agent-
+        level branches (memory / clarify / delegate_task / session_search
+        / plugin pre-call hooks) are commented placeholders so future
+        cherry-picks land cleanly.
+        """
+        # _ = pre_tool_block_checked  # reserved for future plugin parity
+
+        if function_name == "todo":
+            from tools.todo_tool import todo_tool as _todo_tool
+            return _todo_tool(
+                todos=function_args.get("todos"),
+                merge=function_args.get("merge", False),
+                store=self._todo_store,
+            )
+
+        # The branches below are reserved for upstream parity.  They are
+        # not yet ported — falling through to registry dispatch returns a
+        # clean "Unknown tool" JSON error if the model invokes them.
+        # elif function_name == "session_search":   # §2.5 conversation persistence
+        #     ...
+        # elif function_name == "memory":           # §2.7 memory manager
+        #     ...
+        # elif function_name == "clarify":          # §2.6 interactive prompts
+        #     ...
+        # elif function_name == "delegate_task":    # §2.4 sub-agent fan-out
+        #     return self._dispatch_delegate_task(function_args)
+
+        return self._dispatch_tool_call(function_name, function_args)
+
     @staticmethod
     def _parse_tool_arguments(raw: Any) -> Dict[str, Any]:
         """Best-effort parse of ``tool_calls[*].function.arguments`` to a dict."""
@@ -599,38 +801,15 @@ class AIAgent:
                 stop_reason = "completed"
                 break
 
-            # Dispatch each tool call sequentially (parallel exec arrives in Phase 7+).
-            from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
-            for tc in serialized_calls:
-                fn = tc["function"]
-                name = fn["name"]
-                args = self._parse_tool_arguments(fn["arguments"])
-                self._vprint(f"[loop]   tool: {name}({list(args.keys())})")
-                result = self._dispatch_tool_call(name, args)
-                result_str = result if isinstance(result, str) else str(result)
-                # Layer 2: per-result persistence — spill oversized results
-                # into the sandbox temp dir so the model still sees a
-                # preview + path reference instead of consuming context.
-                result_str = maybe_persist_tool_result(
-                    content=result_str,
-                    tool_name=name,
-                    tool_use_id=tc["id"],
-                    env=self._get_active_terminal_env(),
-                )
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": result_str,
-                })
-                if self.tool_delay:
-                    time.sleep(self.tool_delay)
-
-            # Layer 3: aggregate per-turn budget — if the combined size of
-            # this round's tool results still exceeds MAX_TURN_BUDGET_CHARS,
-            # spill the largest non-persisted ones until under budget.
-            if serialized_calls:
-                turn_msgs = messages[-len(serialized_calls):]
-                enforce_turn_budget(turn_msgs, env=self._get_active_terminal_env())
+            # Dispatch the whole batch through the tool-execution subsystem.
+            # _execute_tool_calls picks sequential vs concurrent (currently
+            # always sequential — see _should_parallelize_tool_batch).
+            self._execute_tool_calls(
+                assistant_msg,
+                messages,
+                effective_task_id=self._current_task_id or "default",
+                api_call_count=api_call_count,
+            )
 
         else:
             # Loop exhausted max_iterations cleanly.

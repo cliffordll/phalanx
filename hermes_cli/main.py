@@ -108,6 +108,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tools_run.add_argument("--args", default="{}",
                              help="JSON-encoded tool arguments")
     p_tools_run.set_defaults(func=cmd_tools_run)
+    p_tools_schema = p_tools_sub.add_parser(
+        "schema", help="dump a tool's JSON Schema"
+    )
+    p_tools_schema.add_argument("name", help="tool name")
+    p_tools_schema.set_defaults(func=cmd_tools_schema)
+    p_tools_dry = p_tools_sub.add_parser(
+        "dry-run", help="validate --args against the tool's schema without invoking",
+    )
+    p_tools_dry.add_argument("name", help="tool name")
+    p_tools_dry.add_argument("--args", default="{}",
+                             help="JSON-encoded tool arguments to validate")
+    p_tools_dry.set_defaults(func=cmd_tools_dry_run)
     p_tools.set_defaults(func=cmd_tools_help)
 
     # config -----------------------------------------------------------
@@ -251,7 +263,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
 
 
 def cmd_tools_help(args: argparse.Namespace) -> int:
-    print("usage: hermes tools <list|run> ...")
+    print("usage: hermes tools <list|run|schema|dry-run> ...")
     return 0
 
 
@@ -311,6 +323,87 @@ def cmd_tools_run(args: argparse.Namespace) -> int:
     else:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
+
+
+def cmd_tools_schema(args: argparse.Namespace) -> int:
+    """Dump a single tool's JSON Schema as pretty-printed JSON."""
+    registry = _load_tool_registry()
+    if registry is None:
+        sys.stderr.write("error: no tool registry loaded\n")
+        return 2
+    schema = registry.get_schema(args.name)
+    if schema is None:
+        sys.stderr.write(f"error: unknown tool {args.name!r}\n")
+        return 2
+    print(json.dumps(schema, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_tools_dry_run(args: argparse.Namespace) -> int:
+    """Validate --args against the tool's JSON Schema without dispatching.
+
+    Useful for catching missing required fields, wrong types, and JSON
+    parse errors before invoking a tool with side effects (write_file,
+    patch, terminal, …).
+    """
+    registry = _load_tool_registry()
+    if registry is None:
+        sys.stderr.write("error: no tool registry loaded\n")
+        return 2
+
+    schema = registry.get_schema(args.name)
+    if schema is None:
+        sys.stderr.write(f"error: unknown tool {args.name!r}\n")
+        return 2
+
+    try:
+        parsed_args = json.loads(args.args)
+    except json.JSONDecodeError as exc:
+        sys.stderr.write(f"error: --args must be valid JSON: {exc}\n")
+        return 2
+    if not isinstance(parsed_args, dict):
+        sys.stderr.write("error: --args must decode to a JSON object\n")
+        return 2
+
+    # Tool schemas store the parameters object under "parameters" (OpenAI
+    # function-calling convention); fall back to the top-level dict for
+    # any registrations that already pre-extracted it.
+    param_schema = schema.get("parameters") if isinstance(schema, dict) else None
+    if not isinstance(param_schema, dict):
+        param_schema = schema
+
+    try:
+        from jsonschema import Draft202012Validator
+    except ImportError:
+        sys.stderr.write(
+            "error: jsonschema is required for `tools dry-run`; "
+            "run `pip install jsonschema` or reinstall phalanx.\n"
+        )
+        return 2
+
+    try:
+        validator = Draft202012Validator(param_schema)
+    except Exception as exc:
+        sys.stderr.write(f"error: tool {args.name!r} has invalid schema: {exc}\n")
+        return 2
+
+    errors = sorted(validator.iter_errors(parsed_args), key=lambda e: list(e.path))
+    if not errors:
+        print(json.dumps(
+            {"tool": args.name, "valid": True, "args": parsed_args},
+            ensure_ascii=False, indent=2,
+        ))
+        return 0
+
+    formatted = []
+    for err in errors:
+        path = ".".join(str(p) for p in err.path) or "<root>"
+        formatted.append({"path": path, "message": err.message})
+    print(json.dumps(
+        {"tool": args.name, "valid": False, "errors": formatted},
+        ensure_ascii=False, indent=2,
+    ))
+    return 1
 
 
 def cmd_config_help(args: argparse.Namespace) -> int:
