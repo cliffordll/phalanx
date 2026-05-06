@@ -610,6 +610,36 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def session_count(self) -> int:
+        """Count of all rows in the ``sessions`` table.
+
+        Used by web /api/sessions pagination total and /api/status
+        snapshot.  Includes child / branched sessions; the SessionsPage
+        frontend displays whatever ``list_sessions_rich`` returns
+        (which filters children by default), so the totals don't have
+        to match — the page just shows "N visible of M total".
+        """
+        with self._lock:
+            cursor = self._conn.execute("SELECT COUNT(*) FROM sessions")
+            row = cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    def set_session_title(self, session_id: str, title: Optional[str]) -> None:
+        """Set the displayable title for a session.
+
+        ``None`` clears the title (the unique index on ``title``
+        excludes NULLs, so multiple untitled sessions remain legal).
+        Raises ``sqlite3.IntegrityError`` if ``title`` collides with an
+        existing one — callers (CLI / web) decide whether to surface
+        409 or auto-rename ("foo (2)").
+        """
+        def _do(conn: sqlite3.Connection) -> None:
+            conn.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?",
+                (title, session_id),
+            )
+        self._execute_write(_do)
+
     def update_token_counts(
         self,
         session_id: str,

@@ -26,6 +26,7 @@ import hmac
 import logging
 import os
 import secrets
+import sqlite3
 import sys
 import threading
 import time
@@ -33,10 +34,11 @@ from pathlib import Path
 from typing import Optional
 
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
+    from pydantic import BaseModel
 except ImportError as exc:
     raise SystemExit(
         "Web UI requires fastapi and uvicorn.\n"
@@ -262,6 +264,258 @@ async def get_status():
         "active_sessions": active_sessions,
         "tools": tools_list,
     }
+
+
+# ── Sessions endpoints (wave 2) ────────────────────────────────────────
+
+
+@app.get("/api/sessions")
+async def get_sessions(limit: int = 20, offset: int = 0):
+    """Paginated session list.  ``is_active`` is true if no ``ended_at``
+    row exists and the last activity was within 5 minutes."""
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        sessions = db.list_sessions_rich(limit=limit, offset=offset)
+        total = db.session_count()
+        now = time.time()
+        for s in sessions:
+            last = s.get("last_active") or s.get("started_at") or 0
+            s["is_active"] = s.get("ended_at") is None and (now - last) < 300
+        return {
+            "sessions": sessions,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+    finally:
+        db.close()
+
+
+@app.get("/api/sessions/{session_id}")
+async def get_session_detail(session_id: str):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        sid = db.resolve_session_id(session_id)
+        session = db.get_session(sid) if sid else None
+        if not session:
+            raise HTTPException(status_code=404, detail="Session not found")
+        return session
+    finally:
+        db.close()
+
+
+@app.get("/api/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        sid = db.resolve_session_id(session_id)
+        if not sid:
+            raise HTTPException(status_code=404, detail="Session not found")
+        messages = db.get_messages(sid)
+        return {"session_id": sid, "messages": messages}
+    finally:
+        db.close()
+
+
+@app.delete("/api/sessions/{session_id}")
+async def delete_session_endpoint(session_id: str):
+    """Delete a session and its messages.  Accepts a full id or unique
+    prefix; returns 404 if neither matches."""
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        sid = db.resolve_session_id(session_id)
+        if not sid or not db.delete_session(sid):
+            raise HTTPException(status_code=404, detail="Session not found")
+        return {"ok": True}
+    finally:
+        db.close()
+
+
+class _SessionTitleUpdate(BaseModel):
+    title: Optional[str] = None
+
+
+@app.put("/api/sessions/{session_id}/title")
+async def set_session_title_endpoint(
+    session_id: str, body: _SessionTitleUpdate
+):
+    """Set (or clear with ``null``) a session's display title.
+
+    409 on unique-index conflict — the SessionsPage falls back to a
+    "title already in use" toast and lets the user pick another.
+    """
+    from hermes_state import SessionDB
+
+    db = SessionDB()
+    try:
+        sid = db.resolve_session_id(session_id)
+        if not sid:
+            raise HTTPException(status_code=404, detail="Session not found")
+        try:
+            db.set_session_title(sid, body.title)
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Title already in use: {body.title!r}",
+            ) from exc
+        return {"ok": True, "session_id": sid, "title": body.title}
+    finally:
+        db.close()
+
+
+# ── Logs endpoint (wave 2) ─────────────────────────────────────────────
+
+
+@app.get("/api/logs")
+async def get_logs(
+    file: str = "agent",
+    lines: int = 100,
+    level: Optional[str] = None,
+    component: Optional[str] = None,
+    search: Optional[str] = None,
+):
+    """Tail a phalanx log file with optional level / component / search filtering.
+
+    File must be one of ``LOG_FILES`` (currently agent / errors / gateway).
+    ``level`` filters at or above the threshold; ``component`` matches the
+    upstream-style logger-prefix groups in ``hermes_logging.COMPONENT_PREFIXES``.
+    ``search`` is a case-insensitive substring filter applied after the
+    structural filters.
+    """
+    from hermes_cli.logs import LOG_FILES, _read_tail
+
+    log_name = LOG_FILES.get(file)
+    if not log_name:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown log file: {file!r}. "
+                f"Available: {', '.join(sorted(LOG_FILES))}"
+            ),
+        )
+    log_path = get_hermes_home() / "logs" / log_name
+    if not log_path.exists():
+        return {"file": file, "lines": []}
+
+    try:
+        from hermes_logging import COMPONENT_PREFIXES
+    except ImportError:  # pragma: no cover
+        COMPONENT_PREFIXES = {}
+
+    # ALL / "" / None => no level filter
+    min_level = level if level and level.upper() != "ALL" else None
+    if component and component.lower() != "all":
+        comp_prefixes = COMPONENT_PREFIXES.get(component.lower())
+        if comp_prefixes is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown component: {component!r}. "
+                    f"Available: {', '.join(sorted(COMPONENT_PREFIXES))}"
+                ),
+            )
+    else:
+        comp_prefixes = None
+
+    has_filters = bool(min_level or comp_prefixes or search)
+    cap = max(1, min(lines, 500))
+    raw = _read_tail(
+        log_path,
+        cap if not search else 2000,
+        has_filters=has_filters,
+        min_level=min_level,
+        component_prefixes=comp_prefixes,
+    )
+    if search:
+        needle = search.lower()
+        raw = [line for line in raw if needle in line.lower()][-cap:]
+    return {"file": file, "lines": raw}
+
+
+# ── Analytics endpoint (wave 2) ────────────────────────────────────────
+
+
+@app.get("/api/analytics/usage")
+async def get_usage_analytics(days: int = 30):
+    """Token / cost / session counts aggregated from SessionDB.
+
+    Phalanx omits the upstream ``insights`` skill summary block — no
+    skills subsystem yet.  Daily / by_model / totals buckets match the
+    upstream shape so AnalyticsPage cherry-picks land cleanly.
+    """
+    from hermes_state import SessionDB
+
+    days = max(1, min(days, 365))
+    db = SessionDB()
+    try:
+        cutoff = time.time() - (days * 86400)
+        cur = db._conn.execute(
+            """
+            SELECT date(started_at, 'unixepoch') AS day,
+                   COALESCE(SUM(input_tokens), 0)  AS input_tokens,
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                   COALESCE(SUM(reasoning_tokens), 0)  AS reasoning_tokens,
+                   COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost,
+                   COALESCE(SUM(actual_cost_usd), 0)    AS actual_cost,
+                   COUNT(*) AS sessions,
+                   COALESCE(SUM(api_call_count), 0) AS api_calls
+            FROM sessions WHERE started_at > ?
+            GROUP BY day ORDER BY day
+            """,
+            (cutoff,),
+        )
+        daily = [dict(r) for r in cur.fetchall()]
+
+        cur2 = db._conn.execute(
+            """
+            SELECT model,
+                   COALESCE(SUM(input_tokens), 0)  AS input_tokens,
+                   COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                   COALESCE(SUM(estimated_cost_usd), 0) AS estimated_cost,
+                   COUNT(*) AS sessions,
+                   COALESCE(SUM(api_call_count), 0) AS api_calls
+            FROM sessions
+            WHERE started_at > ? AND model IS NOT NULL
+            GROUP BY model
+            ORDER BY SUM(input_tokens) + SUM(output_tokens) DESC
+            """,
+            (cutoff,),
+        )
+        by_model = [dict(r) for r in cur2.fetchall()]
+
+        cur3 = db._conn.execute(
+            """
+            SELECT COALESCE(SUM(input_tokens), 0)  AS total_input,
+                   COALESCE(SUM(output_tokens), 0) AS total_output,
+                   COALESCE(SUM(cache_read_tokens), 0) AS total_cache_read,
+                   COALESCE(SUM(reasoning_tokens), 0)  AS total_reasoning,
+                   COALESCE(SUM(estimated_cost_usd), 0) AS total_estimated_cost,
+                   COALESCE(SUM(actual_cost_usd), 0)    AS total_actual_cost,
+                   COUNT(*) AS total_sessions,
+                   COALESCE(SUM(api_call_count), 0) AS total_api_calls
+            FROM sessions WHERE started_at > ?
+            """,
+            (cutoff,),
+        )
+        totals = dict(cur3.fetchone()) if cur3 else {}
+
+        return {
+            "daily": daily,
+            "by_model": by_model,
+            "totals": totals,
+            "period_days": days,
+        }
+    finally:
+        db.close()
 
 
 # ── SPA mount ──────────────────────────────────────────────────────────
