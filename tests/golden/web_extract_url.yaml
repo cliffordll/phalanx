@@ -1,0 +1,17 @@
+# Web — `web_extract` reach.
+task_id: web_extract_url
+category: web
+description: |
+  Forces web_extract use by giving the agent a known URL and asking
+  about its content.  Doesn't validate the extracted text (subject
+  to upstream layout changes).
+
+prompt: |
+  Fetch the page at https://example.com and report what its main
+  heading (h1) text says.
+
+verifier_type: tool_called
+expected:
+  tool: web_extract
+  args_subset:
+    url: https://example.com

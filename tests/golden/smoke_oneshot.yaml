@@ -1,0 +1,17 @@
+# Smoke — minimal end-to-end loop check.
+#
+# Doesn't exercise tools, just verifies the agent can produce a final
+# response that includes a literal token.  If this task fails, the
+# whole eval pipeline is broken (auth / model / loop closure issue).
+task_id: smoke_oneshot
+category: smoke
+description: |
+  Minimum viable golden task — agent receives a one-line prompt and
+  must include a literal sentinel string in its reply.  No tool use
+  required.
+
+prompt: "Reply with the literal string 'pong-phalanx' and nothing else, then stop."
+
+verifier_type: exact_match
+expected:
+  contains: ["pong-phalanx"]

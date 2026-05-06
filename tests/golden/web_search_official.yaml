@@ -1,0 +1,19 @@
+# Web — `web_search` reach.
+#
+# Skip locally when no FIRECRAWL_API_KEY / TAVILY_API_KEY / EXA_API_KEY
+# is set — wave 3's runner honours an "env_required" skip list (TBD)
+# so the eval doesn't 0/10 when the user hasn't configured a search
+# backend.
+task_id: web_search_official
+category: web
+description: |
+  Tests that the agent uses web_search when given a fact-finding task
+  rather than hallucinating a URL.
+
+prompt: |
+  Use web search to find the canonical official documentation URL for
+  Python's `argparse` module on docs.python.org and report it.
+
+verifier_type: tool_called
+expected:
+  tool: web_search

@@ -1,0 +1,18 @@
+# File ops — `read_file` happy path.
+task_id: file_read_pyproject
+category: file
+description: |
+  Verifies the agent reaches for the read_file tool when asked about a
+  specific file's contents.  Doesn't check the answer text (the project
+  name might appear in many forms), just that the tool was invoked.
+
+prompt: "Read the pyproject.toml at the repository root and tell me the project's `name` field value."
+
+verifier_type: tool_called
+expected:
+  tool: read_file
+  # Optional args_subset (wave 3 will respect this) — confirms the
+  # agent passed the right path.  Subset semantics: every key here
+  # must match the value the agent passed (exact compare).
+  args_subset:
+    path: pyproject.toml

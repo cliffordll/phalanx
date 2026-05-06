@@ -122,10 +122,28 @@ def test_load_task_raises_on_missing(tmp_path):
 
 
 def test_repo_default_dir_loads():
-    """tests/golden/example_smoke.yaml should always be loadable."""
+    """tests/golden/ ships the wave-2 seed set; check it parses end to end
+    and covers the categories the eval breakdown promised."""
     tasks = load_golden_tasks()
+    assert len(tasks) >= 10, "wave 2 seeded 10 tasks; loader should return all of them"
+
     ids = {t.task_id for t in tasks}
-    assert "example_smoke" in ids
+    # Anchor a few representative ids per category so renames flag in CI.
+    assert "smoke_oneshot" in ids
+    assert "file_read_pyproject" in ids
+    assert "web_search_official" in ids
+    assert "plan_explain_closure" in ids
+    assert "multi_search_then_read" in ids
+
+    categories = {t.category for t in tasks}
+    assert {"smoke", "file", "web", "plan", "multi-tool"} <= categories
+
+    # Verifier_type values must all be in the (currently planned) wave-3 set.
+    expected_verifiers = {"exact_match", "tool_called", "file_state"}
+    actual_verifiers = {t.verifier_type for t in tasks}
+    assert actual_verifiers <= expected_verifiers, (
+        f"unexpected verifier types: {actual_verifiers - expected_verifiers}"
+    )
 
 
 # ── Runner skeleton ──────────────────────────────────────────────────
@@ -274,13 +292,13 @@ def test_format_report_json_matches_summary_shape():
 
 
 def test_cmd_eval_list_runs(capsys):
-    """`hermes eval list` should not crash and should mention the seeded task."""
+    """`hermes eval list` should not crash and should print the wave-2 set."""
     from hermes_cli.main import cmd_eval_list
 
     rc = cmd_eval_list(SimpleNamespace(dir=None))
     assert rc == 0
     out = capsys.readouterr().out
-    assert "example_smoke" in out
+    assert "smoke_oneshot" in out
     assert "tasks" in out
 
 

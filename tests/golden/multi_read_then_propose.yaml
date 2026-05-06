@@ -1,0 +1,18 @@
+# Multi-tool — read → propose.
+task_id: multi_read_then_propose
+category: multi-tool
+description: |
+  Tests that the agent reads concrete content before drafting a
+  proposal (vs hallucinating from prompt alone).  Verifier checks
+  the read; quality of the proposal isn't gated.
+
+prompt: |
+  Read README.md at the repository root and propose one new top-level
+  section that should be added.  Include a 2-3 line outline of what
+  the section would cover.
+
+verifier_type: tool_called
+expected:
+  tool: read_file
+  args_subset:
+    path: README.md

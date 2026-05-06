@@ -1,0 +1,22 @@
+# File ops — `write_file` / `patch` end state check.
+#
+# Wave 3's file_state verifier resolves `path` relative to the agent's
+# CWD at run start; for now the runner uses the repo root so the file
+# lands at <repo>/eval_artifact.txt.  Wave 4 may add per-task tmp
+# sandboxing so this stops polluting the repo working tree.
+task_id: file_patch_create_file
+category: file
+description: |
+  Tests that the agent uses a write tool (write_file or patch) to
+  create a file with specific content.  file_state verifier inspects
+  the post-run filesystem instead of the model output.
+
+prompt: |
+  Create a file named `eval_artifact.txt` in the current working
+  directory.  Its contents should be exactly the single line
+  `phalanx-eval-marker` followed by a newline.  Then stop.
+
+verifier_type: file_state
+expected:
+  path: eval_artifact.txt
+  contains: "phalanx-eval-marker"

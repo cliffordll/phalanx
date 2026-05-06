@@ -1,0 +1,17 @@
+# Multi-tool — search → read chain.
+task_id: multi_search_then_read
+category: multi-tool
+description: |
+  Forces the agent to chain search_files → read_file: the symbol
+  location isn't known up front, and answering requires reading the
+  file's actual code.  Verifier checks the final tool only — the
+  search step is implied by reaching the read.
+
+prompt: |
+  Find the file in this repository that defines `class IterationBudget`,
+  then read it and explain what the `consume()` method returns when
+  the budget is full.
+
+verifier_type: tool_called
+expected:
+  tool: read_file

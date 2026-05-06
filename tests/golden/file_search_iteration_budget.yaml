@@ -1,0 +1,15 @@
+# File ops — `search_files` reach.
+task_id: file_search_iteration_budget
+category: file
+description: |
+  Forces the agent to use search_files (rather than guessing or
+  reading every file) by asking for a symbol it can't possibly know
+  the location of without searching.
+
+prompt: |
+  Find the Python file in this repository that defines `class
+  IterationBudget` and report its path.
+
+verifier_type: tool_called
+expected:
+  tool: search_files

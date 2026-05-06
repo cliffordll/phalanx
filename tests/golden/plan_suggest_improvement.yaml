@@ -1,0 +1,18 @@
+# Plan — read code, then make a suggestion.
+task_id: plan_suggest_improvement
+category: plan
+description: |
+  Two-step task disguised as one — the agent must read a file before
+  it can answer specifically.  We verify the read happened; we don't
+  judge the suggestion's quality (that needs LLM-as-judge, deferred).
+
+prompt: |
+  Look at hermes_cli/eval.py (it's the evaluation harness skeleton)
+  and propose one specific, concrete improvement.  Cite a function
+  or section by name.
+
+verifier_type: tool_called
+expected:
+  tool: read_file
+  args_subset:
+    path: hermes_cli/eval.py

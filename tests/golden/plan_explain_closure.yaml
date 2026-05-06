@@ -1,0 +1,14 @@
+# Plan — knowledge question, no tool use.
+task_id: plan_explain_closure
+category: plan
+description: |
+  Pure-LLM knowledge check.  Both keywords are required so the agent
+  has to actually answer (the prompt itself doesn't contain "function").
+
+prompt: "In one sentence, explain what a Python closure is."
+
+verifier_type: exact_match
+expected:
+  # Wave 3 default: case-insensitive substring AND across the list.
+  contains: ["closure", "function"]
+  case_insensitive: true
