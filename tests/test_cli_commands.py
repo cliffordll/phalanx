@@ -8,7 +8,6 @@ from hermes_cli.commands import (
     COMMAND_REGISTRY,
     COMMANDS,
     COMMANDS_BY_CATEGORY,
-    CommandDef,
     SUBCOMMANDS,
     SlashCommandCompleter,
     _build_command_lookup,

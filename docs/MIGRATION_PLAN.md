@@ -371,27 +371,76 @@ python -m hermes_cli                                       # 默认进入 REPL
 
 ---
 
-### 2.7 Phase 7+ — 后续按需扩展
+### 2.7 Phase 7 — Web dashboard MVP（5–7 天）
 
-每一项作为独立 feature 分支完成。每项都要随 CLI 子命令一起出（如 `phalanx skills list`、`phalanx kanban add`、`phalanx mcp connect` 等），保持"每期可调试"的节奏。
+把 phalanx 的"已落地子系统"全部接到一个浏览器 console：sessions 管理 + 日志查看 + 配置编辑 + env / API key 管理 + 用量看板。靠 `hermes web` CLI 一键起，FastAPI 后端 + React SPA 单一进程，token 鉴权防 CSRF。
 
-- **memory & context**：`agent/memory_manager.py`、`agent/context_compressor.py`、`agent/context_engine.py`、`agent/context_references.py`
-- **guardrails**：`agent/tool_guardrails.py`、`tools/skills_guard.py`、`tools/tirith_security.py`、`tools/website_policy.py`
-- **credentials**：`agent/credential_pool.py`、`agent/credential_sources.py`、`agent/google_oauth.py`、`hermes_cli/auth*.py`
-- **skills 系统**：`skills/`、`optional-skills/`、`agent/skill_*.py`、`tools/skill*.py`、`tools/skills_hub.py`、`hermes_cli/skills_*.py`
-- **gateway / 平台桥接**：`gateway/`、`hermes_cli/gateway.py`、`hermes_cli/slack_cli.py`、`hermes_cli/dingtalk_auth.py`、`hermes_cli/copilot_auth.py`
-- **web dashboard**：`web/`、`hermes_cli/web_server.py`
-- **kanban**：`tools/kanban_tools.py`、`hermes_cli/kanban*.py`
-- **cron**：`cron/`、`tools/cronjob_tools.py`、`hermes_cli/cron.py`
-- **MCP**：`tools/mcp_tool.py`、`tools/mcp_oauth*.py`、`mcp_serve.py`、`hermes_cli/mcp_config.py`
-- **ACP**：`acp_adapter/`、`acp_registry/`、`agent/copilot_acp_client.py`
-- **browser**：`tools/browser_*.py`、`tools/browser_providers/`
-- **voice**：`tools/tts_tool.py`、`tools/transcription_tools.py`、`tools/voice_mode.py`、`tools/neutts_synth.py`、`hermes_cli/voice.py`
-- **checkpoints**：`tools/checkpoint_manager.py`
-- **delegate / 子 agent**：`tools/delegate_tool.py`、`agent/auxiliary_client.py`、`agent/curator.py`
-- **RL / training**：`tinker-atropos/`、`rl_cli.py`、`tools/rl_training_tool.py`
-- **batch / dataset gen**：`batch_runner.py`、`mini_swe_runner.py`、`datagen-config-examples/`
-- **plugins**：`plugins/`、`hermes_cli/plugins.py`、`hermes_cli/plugins_cmd.py`
+设计文档：[`phase-2.7-web-dashboard.md`](phase-2.7-web-dashboard.md)。
+
+| 源文件 | 策略 |
+|---|---|
+| `hermes_cli/web_server.py`（上游 4049 行） | **裁剪移植**：保留 token 鉴权中间件 / 静态 SPA serve / `/api/status` `/api/sessions*` `/api/logs` `/api/analytics/usage` `/api/config*` `/api/env*` 端点；删 cron / profiles / skills / plugins / OAuth / gateway / update 端点（依赖 §2.8 各子系统未移植） |
+| `hermes_cli/main.py` | 加 `cmd_web(--port, --no-open, --token)` 子命令，启 uvicorn 单 worker |
+| `web/`（上游 ~6800 行 11598 含 lock）| **照抄前端栈**：Vite + React 19 + TS + Tailwind v4 + shadcn 风格自卷组件；MVP 出 6 个 page（Status / Sessions / Logs / Config / Env / Analytics）；缺 backing 的 page（Chat / Cron / Skills / Plugins / Profiles / Models 详情 / Docs）**完全不在 NavBar 出现**——保持 phalanx MVP "看起来功能完整一致" |
+| `pyproject.toml` | 加 `fastapi` `uvicorn[standard]` 依赖；`web_dist/` 通过 `[tool.setuptools.package-data]` 打进 wheel |
+| `MANIFEST.in` | sdist 同步 `web_dist/` |
+| `.github/workflows/ci.yml` | frontend build step：`setup-node` + `npm ci` + `npm run build` 在 Python build 之前 |
+
+#### 2.7.1 Phase 7 新增 CLI 能力
+
+```bash
+hermes web                          # 起 dashboard（默认 :9119，自动开浏览器）
+hermes web --port 8080 --no-open    # 自定义端口、不开浏览器
+hermes web --token <hex>            # 复用固定 token（CI / 测试场景）
+```
+
+#### 2.7.2 6 wave 分解
+
+| Wave | 内容 | 估行 |
+|---|---|---|
+| 1 | 后端骨架：FastAPI app + token 鉴权中间件 + `/api/status` + `cmd_web` CLI + 静态 SPA serve（占位 `index.html`）+ `fastapi`/`uvicorn` 依赖 | ~600 |
+| 2 | 后端 read-side：`/api/sessions` (list/messages/delete) + `/api/logs` + `/api/analytics/usage`（usage 从 SessionDB 算） | ~400 |
+| 3 | 后端 write-side：`/api/config` (GET/PUT/raw) + `/api/config/schema` + `/api/env` (GET/PUT/DELETE/reveal)；reveal 走 token 二次校验 | ~350 |
+| 4 | 前端骨架：Vite + React + Tailwind + shadcn 组件 + `App.tsx` 路由 + `lib/api.ts`（裁剪到 phalanx 已实现端点）+ StatusPage + SessionsPage（list / resume / delete / 改 title） | ~1400 |
+| 5 | 前端 LogsPage + ConfigPage + EnvPage + AnalyticsPage；缺 backing 的页面在 NavBar 隐藏 | ~1500 |
+| 6 | 打包：`npm run build` → `hermes_cli/web_dist/`；`pyproject.toml` package-data；CI frontend build step；wheel 装完后 `hermes web` 验证 | ~150 |
+
+#### 2.7.3 验收
+
+```bash
+pytest tests/                                                 # 全过（含 ~30 个新增 web 后端用例）
+cd web && npm run build                                       # 出 ../hermes_cli/web_dist/
+pip install -e .
+hermes web --no-open --port 9119 &                            # 起服务
+curl -s http://127.0.0.1:9119/api/status                      # 401（无 token）
+curl -s -H "X-Hermes-Session-Token: $HERMES_TOKEN" \
+     http://127.0.0.1:9119/api/sessions | jq .                # 200 + 列表
+xdg-open http://127.0.0.1:9119/                                # 浏览器看 SPA，session 列表完整
+```
+
+---
+
+### 2.8 Phase 8+ — 后续按需扩展
+
+每一项作为独立 feature 分支完成。每项都要随 CLI 子命令一起出（如 `phalanx skills list`、`phalanx kanban add`、`phalanx mcp connect` 等），保持"每期可调试"的节奏。每项落地后回到 §2.7 web dashboard 把对应 page 加进 NavBar。
+
+- **memory & context** — 跨 session 长期记忆 + 接近上下文上限时自动摘要压缩 + `@reference` 文件/差异引用解析：`agent/memory_manager.py`、`agent/context_compressor.py`、`agent/context_engine.py`、`agent/context_references.py`
+- **guardrails** — 工具调用前置审查（危险命令二次确认、SSRF / 敏感数据扫描、skill 调用合规校验）：`agent/tool_guardrails.py`、`tools/skills_guard.py`、`tools/tirith_security.py`、`tools/website_policy.py`
+- **credentials** — 多源凭据池（OAuth / managed gateway / env / config.yaml 优先级合并），让 API key / Google OAuth token 不再只能从 env 取：`agent/credential_pool.py`、`agent/credential_sources.py`、`agent/google_oauth.py`、`hermes_cli/auth*.py`
+- **skills 系统** — 用户自定义"可调用 prompt 包"（system prompt + 受限工具子集 + 资源文件），支持分发与按需加载，`/skill <name>` 一键切换：`skills/`、`optional-skills/`、`agent/skill_*.py`、`tools/skill*.py`、`tools/skills_hub.py`、`hermes_cli/skills_*.py`
+- **gateway / 平台桥接** — 把 agent 暴露到 Slack / 钉钉 / Copilot 等 IM 平台，多用户多 session 路由：`gateway/`、`hermes_cli/gateway.py`、`hermes_cli/slack_cli.py`、`hermes_cli/dingtalk_auth.py`、`hermes_cli/copilot_auth.py`
+- **kanban** — 持久化跨 session 任务看板（比 todo 重：列分组 / 状态机 / 优先级 / 关联资源）：`tools/kanban_tools.py`、`hermes_cli/kanban*.py`
+- **cron** — 定时触发 agent（每天 8 点跑某段 prompt 抓资讯、每小时巡检日志）：`cron/`、`tools/cronjob_tools.py`、`hermes_cli/cron.py`
+- **MCP** — 接入 Model Context Protocol 服务器（标准化外部工具 / 资源 / prompt 模板，与 Claude Desktop 等生态互通）：`tools/mcp_tool.py`、`tools/mcp_oauth*.py`、`mcp_serve.py`、`hermes_cli/mcp_config.py`
+- **ACP** — Agent Communication Protocol，多 agent 互调（GitHub Copilot agent 等可作为子 agent 接入）：`acp_adapter/`、`acp_registry/`、`agent/copilot_acp_client.py`
+- **browser** — 真浏览器自动化（Playwright / CDP），不只是 fetch——能点击、填表、读 DOM、截图：`tools/browser_*.py`、`tools/browser_providers/`
+- **voice** — 文字转语音 / 语音转文字 / voice mode 连续对话：`tools/tts_tool.py`、`tools/transcription_tools.py`、`tools/voice_mode.py`、`tools/neutts_synth.py`、`hermes_cli/voice.py`
+- **checkpoints** — turn 级存档 / 回滚 / 分支（`/snapshot` `/rollback` 命令依赖）：`tools/checkpoint_manager.py`
+- **delegate / 子 agent** — 主 agent 派生子 agent 跑独立子任务，共享 IterationBudget（接口已在 §2.1 预留）：`tools/delegate_tool.py`、`agent/auxiliary_client.py`、`agent/curator.py`
+- **web dashboard Chat page** — `/api/chat/stream` SSE + ChatPage 移植（流式 / 工具调用渲染 / 取消请求），§2.7 MVP 暂留 REPL 作主调试入口
+- **RL / training** — 强化学习训练管线（Nous Atropos framework）+ 离线 RL CLI：`tinker-atropos/`、`rl_cli.py`、`tools/rl_training_tool.py`
+- **batch / dataset gen** — 批量跑 agent 生成训练数据 / 跑 SWE-bench / 合成示例：`batch_runner.py`、`mini_swe_runner.py`、`datagen-config-examples/`
+- **plugins** — 第三方插件挂载点（Python entry points + 自动发现 + 启用/禁用 CLI）：`plugins/`、`hermes_cli/plugins.py`、`hermes_cli/plugins_cmd.py`
 
 ---
 
