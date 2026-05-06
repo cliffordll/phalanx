@@ -3,6 +3,10 @@ import { NavLink, Route, Routes, Navigate } from "react-router-dom";
 import { ToastProvider } from "@/components/ui/toast";
 import StatusPage from "@/pages/StatusPage";
 import SessionsPage from "@/pages/SessionsPage";
+import LogsPage from "@/pages/LogsPage";
+import ConfigPage from "@/pages/ConfigPage";
+import EnvPage from "@/pages/EnvPage";
+import AnalyticsPage from "@/pages/AnalyticsPage";
 import { cn } from "@/lib/utils";
 
 interface NavEntry {
@@ -15,6 +19,10 @@ interface NavEntry {
 const NAV: NavEntry[] = [
   { label: "Status", to: "/status" },
   { label: "Sessions", to: "/sessions" },
+  { label: "Logs", to: "/logs" },
+  { label: "Analytics", to: "/analytics" },
+  { label: "Config", to: "/config" },
+  { label: "Env", to: "/env" },
 ];
 
 function NavBar() {
@@ -59,6 +67,10 @@ export default function App() {
             <Route path="/" element={<Navigate to="/status" replace />} />
             <Route path="/status" element={<StatusPage />} />
             <Route path="/sessions" element={<SessionsPage />} />
+            <Route path="/logs" element={<LogsPage />} />
+            <Route path="/analytics" element={<AnalyticsPage />} />
+            <Route path="/config" element={<ConfigPage />} />
+            <Route path="/env" element={<EnvPage />} />
             <Route
               path="*"
               element={
