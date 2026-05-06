@@ -740,3 +740,333 @@ def test_format_report_text_flags_unknown_cost():
     assert "(some unknown)" in out
     # Per-row marker "?" appears next to unknown-cost rows.
     assert "?" in out
+
+
+# ── Wave 4: save_run / load_run / list_runs ──────────────────────────
+
+
+def test_save_run_writes_expected_files(tmp_path):
+    from hermes_cli.eval import save_run
+
+    records = [_record("a", Verdict.PASS), _record("b", Verdict.FAIL)]
+    tasks = [
+        GoldenTask(task_id="a", prompt="x", verifier_type="exact_match", category="file"),
+        GoldenTask(task_id="b", prompt="y", verifier_type="tool_called", category="web"),
+    ]
+    out_dir = save_run(records, tasks=tasks, root=tmp_path, run_id="r1")
+    assert out_dir == tmp_path / "r1"
+    # Required artefacts:
+    assert (out_dir / "records.json").exists()
+    assert (out_dir / "summary.json").exists()
+    assert (out_dir / "tasks.json").exists()
+    assert (out_dir / "report.txt").exists()
+    # records.json round-trips a list, with verdicts as strings.
+    data = json.loads((out_dir / "records.json").read_text(encoding="utf-8"))
+    assert isinstance(data, list)
+    assert {r["task_id"] for r in data} == {"a", "b"}
+    assert data[0]["verdict"] in ("PASS", "FAIL")
+
+
+def test_save_run_omits_tasks_json_when_no_tasks_supplied(tmp_path):
+    from hermes_cli.eval import save_run
+
+    out_dir = save_run([_record("a", Verdict.PASS)], root=tmp_path, run_id="r2")
+    assert (out_dir / "records.json").exists()
+    # tasks.json absent when caller didn't pass tasks=
+    assert not (out_dir / "tasks.json").exists()
+
+
+def test_load_run_round_trips(tmp_path):
+    from hermes_cli.eval import load_run, save_run
+
+    records = [_record("a", Verdict.PASS, input_tokens=11, output_tokens=22)]
+    tasks = [GoldenTask(task_id="a", prompt="x", verifier_type="exact_match", category="file")]
+    save_run(records, tasks=tasks, root=tmp_path, run_id="r3")
+    loaded = load_run("r3", root=tmp_path)
+    assert len(loaded["records"]) == 1
+    assert loaded["records"][0]["task_id"] == "a"
+    assert loaded["records"][0]["input_tokens"] == 11
+    assert loaded["summary"]["task_count"] == 1
+    assert loaded["tasks"][0]["task_id"] == "a"
+
+
+def test_load_run_raises_on_missing(tmp_path):
+    from hermes_cli.eval import load_run
+
+    with pytest.raises(FileNotFoundError):
+        load_run("does-not-exist", root=tmp_path)
+
+
+def test_list_runs_returns_newest_first(tmp_path):
+    from hermes_cli.eval import list_runs, save_run
+
+    save_run([_record("a", Verdict.PASS)], root=tmp_path, run_id="2026-05-06T01-00-00Z")
+    save_run([_record("a", Verdict.PASS)], root=tmp_path, run_id="2026-05-06T03-00-00Z")
+    save_run([_record("a", Verdict.PASS)], root=tmp_path, run_id="2026-05-06T02-00-00Z")
+    runs = list_runs(root=tmp_path)
+    assert [r["run_id"] for r in runs] == [
+        "2026-05-06T03-00-00Z",
+        "2026-05-06T02-00-00Z",
+        "2026-05-06T01-00-00Z",
+    ]
+    # Each entry exposes the cached summary so the CLI can render
+    # pass/fail counts without re-loading every run dir.
+    assert runs[0]["summary"]["task_count"] == 1
+
+
+def test_list_runs_returns_empty_when_root_missing(tmp_path):
+    from hermes_cli.eval import list_runs
+
+    assert list_runs(root=tmp_path / "never-created") == []
+
+
+def test_list_runs_tolerates_corrupt_summary(tmp_path):
+    from hermes_cli.eval import list_runs
+
+    bad = tmp_path / "corrupt-run"
+    bad.mkdir()
+    (bad / "summary.json").write_text("{not json", encoding="utf-8")
+    runs = list_runs(root=tmp_path)
+    assert runs[0]["run_id"] == "corrupt-run"
+    assert runs[0]["summary"] == {}
+
+
+# ── Wave 4: format_diff ─────────────────────────────────────────────
+
+
+def test_format_diff_flags_verdict_change(tmp_path):
+    from hermes_cli.eval import format_diff, save_run
+
+    # Baseline: a=PASS, b=PASS
+    save_run(
+        [_record("a", Verdict.PASS), _record("b", Verdict.PASS)],
+        root=tmp_path, run_id="base",
+    )
+    from hermes_cli.eval import load_run
+    baseline = load_run("base", root=tmp_path)
+
+    # Current: a=PASS (unchanged), b=FAIL (regression)
+    current = [_record("a", Verdict.PASS), _record("b", Verdict.FAIL)]
+    out = format_diff(current, baseline)
+    assert "PASS → FAIL" in out
+    assert "b" in out
+    # "1 task(s) changed" footer for b's verdict change
+    assert "1 task(s) changed" in out
+
+
+def test_format_diff_surfaces_token_delta_without_verdict_change(tmp_path):
+    from hermes_cli.eval import format_diff, load_run, save_run
+
+    save_run(
+        [_record("a", Verdict.PASS, input_tokens=100, output_tokens=20)],
+        root=tmp_path, run_id="b1",
+    )
+    baseline = load_run("b1", root=tmp_path)
+    current = [_record("a", Verdict.PASS, input_tokens=200, output_tokens=20)]
+    out = format_diff(current, baseline)
+    # Token regression must show up even though verdict didn't change.
+    assert "+100" in out
+    assert "unchanged" in out
+
+
+def test_format_diff_lists_new_and_removed_tasks(tmp_path):
+    from hermes_cli.eval import format_diff, load_run, save_run
+
+    save_run([_record("a", Verdict.PASS), _record("b", Verdict.PASS)],
+             root=tmp_path, run_id="b2")
+    baseline = load_run("b2", root=tmp_path)
+    current = [_record("a", Verdict.PASS), _record("c", Verdict.PASS)]
+    out = format_diff(current, baseline)
+    assert "+ c" in out  # new
+    assert "- b" in out  # removed
+    assert "1 new" in out
+    assert "1 removed" in out
+
+
+def test_format_diff_pass_rate_in_footer(tmp_path):
+    from hermes_cli.eval import format_diff, load_run, save_run
+
+    save_run([_record("a", Verdict.PASS), _record("b", Verdict.PASS)],
+             root=tmp_path, run_id="bb")
+    baseline = load_run("bb", root=tmp_path)
+    current = [_record("a", Verdict.FAIL), _record("b", Verdict.PASS)]
+    out = format_diff(current, baseline)
+    # Pass rate moves 100% → 50%; the footer surfaces both.
+    assert "100%" in out
+    assert "50%" in out
+
+
+# ── Wave 4: CLI flags (--baseline / --diff / --no-save / list --runs) ─
+
+
+def test_cmd_eval_run_persists_when_save_enabled(tmp_path, monkeypatch, capsys):
+    """`hermes eval` with default --no-save unset → records.json appears
+    under PHALANX_HOME/eval/<some-run-id>/."""
+    from hermes_cli import eval as eval_mod
+    from hermes_cli.main import cmd_eval_run
+
+    # Redirect PHALANX_HOME so the test never touches the real ~/.phalanx
+    monkeypatch.setenv("PHALANX_HOME", str(tmp_path))
+
+    # Force loader to a single-task tmp dir to avoid running the wave-2
+    # set against a stub factory we don't control here.
+    task_dir = tmp_path / "g"
+    task_dir.mkdir()
+    (task_dir / "x.yaml").write_text(
+        "task_id: x\nprompt: hi\nverifier_type: exact_match\n"
+        "expected: { contains: [hi] }\n",
+        encoding="utf-8",
+    )
+
+    # Stub factory — return _UsageStubAgent that emits "hi" so verifier passes.
+    monkeypatch.setattr(
+        "hermes_cli.main._build_eval_agent_factory",
+        lambda: (lambda task: _UsageStubAgent(final_response="hi there")),
+    )
+
+    args = SimpleNamespace(
+        task=None, dir=str(task_dir), emit_json=False,
+        no_save=False, baseline=None, diff=False,
+    )
+    rc = cmd_eval_run(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "saved:" in out
+    # PHALANX_HOME/eval/<timestamp>/records.json exists.
+    runs = list((tmp_path / "eval").iterdir())
+    assert len(runs) == 1
+    assert (runs[0] / "records.json").exists()
+    # Sanity: cleanup VERIFIERS in case future tests register the same name
+    _ = eval_mod  # silence unused import warning when eval_mod isn't needed
+
+
+def test_cmd_eval_run_no_save_flag(tmp_path, monkeypatch, capsys):
+    from hermes_cli.main import cmd_eval_run
+
+    monkeypatch.setenv("PHALANX_HOME", str(tmp_path))
+    task_dir = tmp_path / "g"
+    task_dir.mkdir()
+    (task_dir / "x.yaml").write_text(
+        "task_id: x\nprompt: hi\nverifier_type: exact_match\n"
+        "expected: { contains: [hi] }\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.main._build_eval_agent_factory",
+        lambda: (lambda task: _UsageStubAgent(final_response="hi")),
+    )
+    args = SimpleNamespace(
+        task=None, dir=str(task_dir), emit_json=False,
+        no_save=True, baseline=None, diff=False,
+    )
+    rc = cmd_eval_run(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "saved:" not in out
+    assert not (tmp_path / "eval").exists()
+
+
+def test_cmd_eval_run_diff_requires_baseline(tmp_path, monkeypatch, capsys):
+    from hermes_cli.main import cmd_eval_run
+
+    monkeypatch.setenv("PHALANX_HOME", str(tmp_path))
+    task_dir = tmp_path / "g"
+    task_dir.mkdir()
+    (task_dir / "x.yaml").write_text(
+        "task_id: x\nprompt: hi\nverifier_type: exact_match\n"
+        "expected: { contains: [hi] }\n",
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        task=None, dir=str(task_dir), emit_json=False,
+        no_save=True, baseline=None, diff=True,
+    )
+    rc = cmd_eval_run(args)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--baseline" in err
+
+
+def test_cmd_eval_run_baseline_loads_and_appends_diff(tmp_path, monkeypatch, capsys):
+    """Run once → save baseline.  Re-run with --baseline → output
+    contains both report and diff sections."""
+    from hermes_cli.eval import save_run
+    from hermes_cli.main import cmd_eval_run
+
+    monkeypatch.setenv("PHALANX_HOME", str(tmp_path))
+    task_dir = tmp_path / "g"
+    task_dir.mkdir()
+    (task_dir / "x.yaml").write_text(
+        "task_id: x\nprompt: hi\nverifier_type: exact_match\n"
+        "expected: { contains: [hi] }\n",
+        encoding="utf-8",
+    )
+    # Hand-craft a baseline matching the same task_id.
+    save_run(
+        [_record("x", Verdict.PASS, input_tokens=50, output_tokens=10)],
+        root=tmp_path / "eval", run_id="baseline-1",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.main._build_eval_agent_factory",
+        lambda: (lambda task: _UsageStubAgent(final_response="hi")),
+    )
+    args = SimpleNamespace(
+        task=None, dir=str(task_dir), emit_json=False,
+        no_save=True, baseline="baseline-1", diff=False,
+    )
+    rc = cmd_eval_run(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Both report (token line) and diff (Pass rate footer) present.
+    assert "tokens=" in out
+    assert "Pass rate" in out
+
+
+def test_cmd_eval_run_baseline_missing(tmp_path, monkeypatch, capsys):
+    from hermes_cli.main import cmd_eval_run
+
+    monkeypatch.setenv("PHALANX_HOME", str(tmp_path))
+    task_dir = tmp_path / "g"
+    task_dir.mkdir()
+    (task_dir / "x.yaml").write_text(
+        "task_id: x\nprompt: hi\nverifier_type: exact_match\n"
+        "expected: { contains: [hi] }\n",
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        task=None, dir=str(task_dir), emit_json=False,
+        no_save=True, baseline="nonexistent", diff=False,
+    )
+    rc = cmd_eval_run(args)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "nonexistent" in err
+
+
+def test_cmd_eval_list_runs_flag(tmp_path, monkeypatch, capsys):
+    """`hermes eval list --runs` reads from PHALANX_HOME/eval/."""
+    from hermes_cli.eval import save_run
+    from hermes_cli.main import cmd_eval_list
+
+    monkeypatch.setenv("PHALANX_HOME", str(tmp_path))
+    save_run(
+        [_record("a", Verdict.PASS, input_tokens=11, output_tokens=22)],
+        root=tmp_path / "eval", run_id="2026-05-06T10-00-00Z",
+    )
+    args = SimpleNamespace(dir=None, runs=True)
+    rc = cmd_eval_list(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "2026-05-06T10-00-00Z" in out
+    assert "1 run" in out
+
+
+def test_cmd_eval_list_runs_empty(tmp_path, monkeypatch, capsys):
+    from hermes_cli.main import cmd_eval_list
+
+    monkeypatch.setenv("PHALANX_HOME", str(tmp_path))
+    args = SimpleNamespace(dir=None, runs=True)
+    rc = cmd_eval_list(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no persisted eval runs" in out

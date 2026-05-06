@@ -66,8 +66,17 @@ def _build_parser() -> argparse.ArgumentParser:
     flag they happen to need.  Result: ``hermes --debug oneshot "..."``
     works, ``hermes oneshot --debug "..."`` does not — same as upstream.
     """
+    # Honour whichever console_script alias actually launched us
+    # (`hermes` upstream-compat or `phalanx` project-native), so
+    # `phalanx --help` doesn't lie about the command name.  Falls back
+    # to ``hermes`` for ``python -m hermes_cli`` and other hosts that
+    # leave argv[0] as a path.
+    invoked = os.path.basename(sys.argv[0]) if sys.argv else "hermes"
+    invoked = os.path.splitext(invoked)[0] or "hermes"  # strip .exe on Windows
+    if invoked not in ("hermes", "phalanx"):
+        invoked = "hermes"
     parser = argparse.ArgumentParser(
-        prog="hermes",
+        prog=invoked,
         description="Phalanx — minimal AI agent ported from hermes-agent",
     )
     parser.add_argument("--debug", action="store_true", help="enable verbose debug output")
@@ -140,13 +149,34 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tools.set_defaults(func=cmd_tools_help)
 
     # config -----------------------------------------------------------
-    p_cfg = sub.add_parser("config", help="show / read user config")
+    p_cfg = sub.add_parser("config", help="show / read / write user config")
     p_cfg_sub = p_cfg.add_subparsers(dest="config_cmd", metavar="<subcmd>")
     p_cfg_show = p_cfg_sub.add_parser("show", help="dump entire config")
     p_cfg_show.set_defaults(func=cmd_config_show)
     p_cfg_get = p_cfg_sub.add_parser("get", help="fetch one nested value")
     p_cfg_get.add_argument("key", help="dotted key path, e.g. model.default")
     p_cfg_get.set_defaults(func=cmd_config_get)
+    p_cfg_set = p_cfg_sub.add_parser(
+        "set", help="set one nested value (atomic write to ~/.phalanx/config.yaml)"
+    )
+    p_cfg_set.add_argument("key", help="dotted key path, e.g. model.default")
+    p_cfg_set.add_argument(
+        "value",
+        help="value to set; pass --json to interpret as JSON (numbers, booleans, lists)",
+    )
+    p_cfg_set.add_argument(
+        "--json", action="store_true", dest="value_is_json",
+        help="interpret value as JSON (e.g. --json 90 → number, --json '[a,b]' → list)",
+    )
+    p_cfg_set.set_defaults(func=cmd_config_set)
+    p_cfg_init = p_cfg_sub.add_parser(
+        "init",
+        help="seed ~/.phalanx/config.yaml with the DEFAULT_CONFIG template "
+             "(refuses to overwrite an existing file unless --force)",
+    )
+    p_cfg_init.add_argument("--force", action="store_true",
+                            help="overwrite an existing config.yaml")
+    p_cfg_init.set_defaults(func=cmd_config_init)
     p_cfg.set_defaults(func=cmd_config_help)
 
     # prompt -----------------------------------------------------------
@@ -276,17 +306,29 @@ def _build_parser() -> argparse.ArgumentParser:
                             help="emit machine-readable report instead of text")
     p_eval_run.add_argument("--dir", default=None,
                             help="alternate golden-task dir (default: tests/golden)")
+    p_eval_run.add_argument("--no-save", action="store_true",
+                            help="skip persisting the run under ~/.phalanx/eval/")
+    p_eval_run.add_argument("--baseline", default=None,
+                            help="run_id of a previous saved run to compare against")
+    p_eval_run.add_argument("--diff", action="store_true",
+                            help="emit only the diff vs --baseline (requires --baseline)")
     p_eval_run.set_defaults(func=cmd_eval_run)
     p_eval_list = p_eval_sub.add_parser(
-        "list", help="list registered golden tasks"
+        "list", help="list registered golden tasks (or --runs for past runs)"
     )
     p_eval_list.add_argument("--dir", default=None)
+    p_eval_list.add_argument("--runs", action="store_true",
+                             help="list persisted eval runs under ~/.phalanx/eval/ "
+                                  "instead of golden-task definitions")
     p_eval_list.set_defaults(func=cmd_eval_list)
     # Bare `hermes eval` runs all (most common usage).
     p_eval.add_argument("--task", default=None,
                         help="run only this task_id (alias for `eval run --task`)")
     p_eval.add_argument("--json", action="store_true", dest="emit_json")
     p_eval.add_argument("--dir", default=None)
+    p_eval.add_argument("--no-save", action="store_true")
+    p_eval.add_argument("--baseline", default=None)
+    p_eval.add_argument("--diff", action="store_true")
     p_eval.set_defaults(func=cmd_eval_default)
 
     # web --------------------------------------------------------------
@@ -938,7 +980,7 @@ def cmd_pricing_estimate(args: argparse.Namespace) -> int:
 
 
 def cmd_config_help(args: argparse.Namespace) -> int:
-    print("usage: hermes config <show|get> ...")
+    print("usage: phalanx config <show|get|set|init> ...")
     return 0
 
 
@@ -967,6 +1009,60 @@ def cmd_config_get(args: argparse.Namespace) -> int:
         print(json.dumps(value, ensure_ascii=False, indent=2))
     else:
         print(value)
+    return 0
+
+
+def cmd_config_set(args: argparse.Namespace) -> int:
+    """Set a nested value and atomically write back to ``~/.phalanx/config.yaml``.
+
+    By default ``value`` is stored as a string; pass ``--json`` to make
+    the parser interpret it as JSON (so ``--json 90`` becomes ``90`` not
+    ``"90"``).  Falls back to string on JSON parse error so naive users
+    don't get cryptic errors when forgetting to quote.
+    """
+    from hermes_cli.config import cfg_set, save_config
+    keys = [k for k in args.key.split(".") if k]
+    if not keys:
+        sys.stderr.write("error: empty key path\n")
+        return 2
+
+    raw = args.value
+    if getattr(args, "value_is_json", False):
+        try:
+            value: Any = json.loads(raw)
+        except (ValueError, TypeError) as exc:
+            sys.stderr.write(f"error: --json supplied but value isn't valid JSON: {exc}\n")
+            return 2
+    else:
+        value = raw
+
+    cfg = load_config() or {}
+    try:
+        cfg_set(cfg, *keys, value=value)
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 1
+    path = save_config(cfg)
+    print(f"set {args.key} → {value!r} ({path})")
+    return 0
+
+
+def cmd_config_init(args: argparse.Namespace) -> int:
+    """Seed ``~/.phalanx/config.yaml`` with the DEFAULT_CONFIG template.
+
+    Refuses to clobber an existing file unless ``--force``.  Useful when
+    the user (a) doesn't have a config yet, or (b) accidentally truncated
+    theirs and wants to re-roll the full template.
+    """
+    from hermes_cli.config import DEFAULT_CONFIG, save_config
+    path = get_config_path()
+    if path.exists() and not getattr(args, "force", False):
+        sys.stderr.write(
+            f"error: {path} already exists; use `phalanx config init --force` to overwrite\n"
+        )
+        return 1
+    save_config(dict(DEFAULT_CONFIG))
+    print(f"wrote default config → {path}")
     return 0
 
 
@@ -1255,14 +1351,26 @@ def _build_eval_agent_factory():
 
 
 def cmd_eval_run(args: argparse.Namespace) -> int:
-    """Run all golden tasks (or one via --task) and print the report."""
+    """Run all golden tasks (or one via --task) and print the report.
+
+    Wave 4 additions:
+      * persist the run under ``~/.phalanx/eval/<timestamp>/`` unless
+        ``--no-save`` is given (so ``--baseline <id> --diff`` works on
+        any past run without the user juggling output files);
+      * ``--baseline <run_id>`` loads a saved run and either appends a
+        diff section to the normal report, or replaces it entirely
+        when ``--diff`` is given.
+    """
     from hermes_cli.eval import (
+        format_diff,
         format_report_json,
         format_report_text,
         load_golden_tasks,
+        load_run,
         load_task,
         run_task,
         run_tasks,
+        save_run,
     )
 
     factory = _build_eval_agent_factory()
@@ -1282,25 +1390,73 @@ def cmd_eval_run(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
 
+    diff_only = getattr(args, "diff", False)
+    baseline_id = getattr(args, "baseline", None)
+    if diff_only and not baseline_id:
+        print("eval: --diff requires --baseline <run_id>", file=sys.stderr)
+        return 2
+
+    baseline_run: Optional[Dict[str, Any]] = None
+    if baseline_id:
+        try:
+            baseline_run = load_run(baseline_id)
+        except FileNotFoundError as exc:
+            print(f"eval: {exc}", file=sys.stderr)
+            return 1
+
     if len(tasks) == 1:
         records = [run_task(factory, tasks[0])]
     else:
         records = run_tasks(factory, tasks)
 
-    if getattr(args, "emit_json", False):
+    saved_path: Optional[Path] = None
+    if not getattr(args, "no_save", False):
+        try:
+            saved_path = save_run(records, tasks=tasks)
+        except OSError as exc:
+            print(f"eval: warning, save_run failed: {exc}", file=sys.stderr)
+
+    if diff_only and baseline_run is not None:
+        print(format_diff(records, baseline_run, tasks=tasks))
+    elif getattr(args, "emit_json", False):
         print(format_report_json(records, tasks=tasks))
     else:
         print(format_report_text(records, tasks=tasks))
+        if baseline_run is not None:
+            print()
+            print(format_diff(records, baseline_run, tasks=tasks))
+        if saved_path is not None:
+            print(f"\nsaved: {saved_path}")
 
-    # Non-zero exit when any task failed or errored — useful for CI gates
-    # later, even though wave 1 verifiers all SKIP.
+    # Non-zero exit when any task failed or errored — useful for CI gates.
     bad = sum(1 for r in records if r.verdict.value in ("FAIL", "ERROR"))
     return 1 if bad else 0
 
 
 def cmd_eval_list(args: argparse.Namespace) -> int:
-    """List registered golden tasks (no execution)."""
-    from hermes_cli.eval import load_golden_tasks
+    """List registered golden tasks, or persisted runs with ``--runs``."""
+    from hermes_cli.eval import list_runs, load_golden_tasks
+
+    if getattr(args, "runs", False):
+        runs = list_runs()
+        if not runs:
+            print("(no persisted eval runs under ~/.phalanx/eval/)")
+            return 0
+        print(f"{'run_id':24s}  {'tasks':>6s}  {'pass':>4s}  {'tokens (in/out)':>20s}")
+        print("─" * 70)
+        for entry in runs:
+            s = entry.get("summary") or {}
+            counts = (s.get("verdicts") or {})
+            pass_n = counts.get("PASS", 0)
+            total = s.get("task_count", 0) or 0
+            in_t = s.get("total_input_tokens", 0) or 0
+            out_t = s.get("total_output_tokens", 0) or 0
+            print(
+                f"{entry['run_id']:24s}  {total:>6d}  "
+                f"{pass_n:>4d}  {in_t:>9d}/{out_t:<9d}"
+            )
+        print(f"\n{len(runs)} run(s)")
+        return 0
 
     try:
         tasks = load_golden_tasks(args.dir)

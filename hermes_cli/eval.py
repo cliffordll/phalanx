@@ -747,3 +747,252 @@ def _summary(
         "pass_rate": (counts[Verdict.PASS.value] / n) if n else 0.0,
         "category_breakdown": category_breakdown,
     }
+
+
+# ── Run persistence (wave 4) ─────────────────────────────────────────
+
+
+# Snapshot directory layout:
+#
+#   ~/.phalanx/eval/
+#       2026-05-06T16-32-33Z/
+#           records.json     ← list of RunRecord dicts (same shape as
+#                              format_report_json's "records")
+#           summary.json     ← _summary() output
+#           tasks.json       ← serialised GoldenTask list (id + category +
+#                              verifier_type + prompt) so --diff works
+#                              without re-loading the YAML
+#           report.txt       ← format_report_text(records, tasks=...)
+#
+# Timestamps avoid colons (Windows-incompatible) — we use
+# YYYY-MM-DDTHH-MM-SSZ.  ``run_id`` is always the directory name.
+
+
+def _eval_root() -> Path:
+    """Resolve the eval persistence root, lazily so test fixtures that
+    monkeypatch ``PHALANX_HOME`` get the override."""
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "eval"
+    except Exception:
+        # Fallback for ultra-minimal test environments where
+        # hermes_constants can't be imported (shouldn't happen in
+        # phalanx itself, but keeps eval.py decoupled).
+        return Path.home() / ".phalanx" / "eval"
+
+
+def _make_run_id(now: Optional[float] = None) -> str:
+    """Filesystem-safe ISO-ish timestamp: ``2026-05-06T16-32-33Z``."""
+    from datetime import datetime, timezone
+    ts = datetime.fromtimestamp(now or time.time(), tz=timezone.utc)
+    return ts.strftime("%Y-%m-%dT%H-%M-%SZ")
+
+
+def _serialise_task(task: GoldenTask) -> Dict[str, Any]:
+    """Pickle-free task snapshot for the run dir.
+
+    Only fields that influence diffs / future re-runs are kept;
+    description/system are dropped to keep the snapshot small.
+    """
+    return {
+        "task_id": task.task_id,
+        "prompt": task.prompt,
+        "verifier_type": task.verifier_type,
+        "category": task.category,
+        "expected": task.expected,
+    }
+
+
+def save_run(
+    records: Sequence[RunRecord],
+    *,
+    tasks: Optional[Sequence[GoldenTask]] = None,
+    root: Optional[Path] = None,
+    run_id: Optional[str] = None,
+) -> Path:
+    """Persist a finished eval run.  Returns the run directory.
+
+    ``root`` defaults to ``<PHALANX_HOME>/eval/``.  ``run_id`` defaults
+    to a fresh UTC timestamp.  Overwrites any existing run dir with the
+    same id (only happens in tests that pin run_id).
+    """
+    base = (root or _eval_root())
+    rid = run_id or _make_run_id()
+    run_dir = base / rid
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    records_payload = [r.to_dict() for r in records]
+    summary_payload = _summary(records, tasks=tasks)
+    tasks_payload = [_serialise_task(t) for t in tasks] if tasks else []
+
+    (run_dir / "records.json").write_text(
+        json.dumps(records_payload, indent=2), encoding="utf-8"
+    )
+    (run_dir / "summary.json").write_text(
+        json.dumps(summary_payload, indent=2), encoding="utf-8"
+    )
+    if tasks_payload:
+        (run_dir / "tasks.json").write_text(
+            json.dumps(tasks_payload, indent=2), encoding="utf-8"
+        )
+    (run_dir / "report.txt").write_text(
+        format_report_text(records, tasks=tasks), encoding="utf-8"
+    )
+    return run_dir
+
+
+def list_runs(root: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """List persisted runs in newest-first order.
+
+    Each entry: ``{run_id, path, summary}``.  ``summary`` is the cached
+    summary.json contents (or ``{}`` if the file is missing/corrupt —
+    lets a partially-written run show up in ``hermes eval list --runs``
+    rather than silently disappearing).
+    """
+    base = (root or _eval_root())
+    if not base.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    for child in sorted(base.iterdir(), reverse=True):
+        if not child.is_dir():
+            continue
+        summary: Dict[str, Any] = {}
+        sf = child / "summary.json"
+        if sf.exists():
+            try:
+                summary = json.loads(sf.read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                summary = {}
+        out.append({"run_id": child.name, "path": str(child), "summary": summary})
+    return out
+
+
+def load_run(
+    run_id: str, root: Optional[Path] = None
+) -> Dict[str, Any]:
+    """Read a persisted run back as ``{records, summary, tasks}`` dicts.
+
+    Raises ``FileNotFoundError`` if ``run_id`` doesn't exist or is
+    missing the required ``records.json``.  ``tasks`` is ``[]`` when
+    the run pre-dates wave 4 (or the run was saved without tasks).
+    """
+    base = (root or _eval_root())
+    run_dir = base / run_id
+    rf = run_dir / "records.json"
+    if not rf.exists():
+        raise FileNotFoundError(f"eval run {run_id!r} not found at {run_dir}")
+    records = json.loads(rf.read_text(encoding="utf-8"))
+    sf = run_dir / "summary.json"
+    summary = json.loads(sf.read_text(encoding="utf-8")) if sf.exists() else {}
+    tf = run_dir / "tasks.json"
+    tasks = json.loads(tf.read_text(encoding="utf-8")) if tf.exists() else []
+    return {"records": records, "summary": summary, "tasks": tasks, "path": str(run_dir)}
+
+
+# ── Run diff (wave 4) ────────────────────────────────────────────────
+
+
+def format_diff(
+    current: Sequence[RunRecord],
+    baseline_run: Dict[str, Any],
+    *,
+    tasks: Optional[Sequence[GoldenTask]] = None,
+) -> str:
+    """Render a textual diff: current run vs a persisted baseline.
+
+    Per task, prints:
+      * verdict change (PASS → FAIL, etc.)
+      * token delta (signed, only when non-zero)
+      * cost delta (signed, four decimals)
+      * tasks present in only one of the two runs
+
+    Designed to be skim-readable in CI; large numeric deltas surface
+    even when verdicts haven't moved (regression in token usage is
+    just as interesting as a verdict flip for the eval loop).
+    """
+    base_records = {
+        r.get("task_id"): r for r in baseline_run.get("records", [])
+        if isinstance(r, dict) and r.get("task_id")
+    }
+    curr_records = {r.task_id: r for r in current}
+
+    all_ids = sorted(set(base_records) | set(curr_records))
+    lines: List[str] = []
+    lines.append(f"diff vs baseline run with {len(base_records)} task(s)")
+    lines.append("─" * 70)
+
+    summary_pass_now = 0
+    summary_pass_was = 0
+    summary_changed = 0
+    only_curr: List[str] = []
+    only_base: List[str] = []
+
+    for tid in all_ids:
+        bv = base_records.get(tid)
+        cv = curr_records.get(tid)
+        if cv is None:
+            only_base.append(tid)
+            continue
+        if bv is None:
+            only_curr.append(tid)
+            lines.append(f"+ {tid:30s}  (new)  {cv.verdict.value}")
+            if cv.verdict == Verdict.PASS:
+                summary_pass_now += 1
+            continue
+
+        was_verdict = str(bv.get("verdict", ""))
+        now_verdict = cv.verdict.value
+        if was_verdict == "PASS":
+            summary_pass_was += 1
+        if now_verdict == "PASS":
+            summary_pass_now += 1
+
+        d_in = cv.input_tokens - int(bv.get("input_tokens", 0) or 0)
+        d_out = cv.output_tokens - int(bv.get("output_tokens", 0) or 0)
+        d_cost = cv.cost_usd - float(bv.get("cost_usd", 0.0) or 0.0)
+        d_turns = cv.turns - int(bv.get("turns", 0) or 0)
+
+        verdict_changed = was_verdict != now_verdict
+        deltas_meaningful = d_in or d_out or d_turns or abs(d_cost) > 1e-6
+        if not verdict_changed and not deltas_meaningful:
+            continue
+
+        summary_changed += 1
+        if verdict_changed:
+            arrow = f"{was_verdict} → {now_verdict}"
+        else:
+            arrow = f"{now_verdict} (unchanged)"
+        parts = [f"  {tid:30s}  {arrow}"]
+        deltas = []
+        if d_in or d_out:
+            deltas.append(f"tokens {d_in:+d}/{d_out:+d}")
+        if d_turns:
+            deltas.append(f"turns {d_turns:+d}")
+        if abs(d_cost) > 1e-6:
+            deltas.append(f"cost {d_cost:+.4f}")
+        if deltas:
+            parts.append("  " + " │ ".join(deltas))
+        lines.append("".join(parts))
+
+    if only_base:
+        lines.append("")
+        lines.append("removed tasks (in baseline only):")
+        for tid in only_base:
+            lines.append(f"  - {tid}")
+
+    lines.append("")
+    lines.append("─" * 70)
+    n_curr = len(curr_records)
+    pass_now_pct = (summary_pass_now / n_curr * 100) if n_curr else 0.0
+    n_base = len(base_records)
+    pass_was_pct = (summary_pass_was / n_base * 100) if n_base else 0.0
+    lines.append(
+        f"Pass rate: {summary_pass_was}/{n_base} ({pass_was_pct:.0f}%) → "
+        f"{summary_pass_now}/{n_curr} ({pass_now_pct:.0f}%) │ "
+        f"{summary_changed} task(s) changed │ "
+        f"{len(only_curr)} new │ {len(only_base)} removed"
+    )
+    # Suppress "tasks" if not used — we only consume it for symmetry with
+    # other renderers; future waves may surface category-level diff.
+    _ = tasks
+    return "\n".join(lines)

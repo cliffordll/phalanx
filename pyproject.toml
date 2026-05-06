@@ -7,7 +7,7 @@ name = "phalanx"
 version = "0.0.1"
 description = "Phalanx — minimal AI agent ported from hermes-agent (Phase 0 skeleton)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
   # Phase 0 needs only pyyaml (utils.py, hermes_time.py, hermes_logging.py).
@@ -49,20 +49,29 @@ dev = [
 ]
 
 # Entry points — registered when phalanx is `pip install -e .`
-# `hermes` and `hermes-agent` names are kept identical to upstream so that
-# any docs/scripts referencing them still work.
+# Two parallel names, one entry point:
+#   * `hermes` / `hermes-agent` keep identical to upstream so docs / scripts /
+#     cherry-picks from hermes-agent still work without rename.
+#   * `phalanx` is the project-native command; preferred in new docs and the
+#     end-user surface.  Same module, no behaviour difference — just a name
+#     that matches `~/.phalanx/`, `PHALANX_HOME`, and the project itself.
 [project.scripts]
+phalanx = "hermes_cli.main:main"
 hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 
 [tool.setuptools]
 # Top-level Python modules (single-file, not packages). All names match
 # hermes-agent upstream so future cherry-picks land cleanly.
+# `run_agent` is the entry point for the `hermes-agent` console_script
+# *and* a runtime dependency of `hermes_cli/main.py:cmd_oneshot` — leaving
+# it off the list left `hermes oneshot` broken outside the project tree.
 py-modules = [
   "hermes_constants",
   "hermes_logging",
   "hermes_state",
   "hermes_time",
+  "run_agent",
   "utils",
 ]
 

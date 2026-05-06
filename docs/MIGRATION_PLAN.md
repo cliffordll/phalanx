@@ -17,6 +17,52 @@
 
 ---
 
+## 0.1 运行入口（A vs B）
+
+后续所有验收 / 操作示例都假设你已经挑了下面两种之一。两条等价。
+
+### 选项 A — `python -m hermes_cli`（不装包，推荐快速调试）
+
+只要在 phalanx 项目根目录里，直接：
+
+```bash
+python -m hermes_cli oneshot "你好"
+python -m hermes_cli eval list
+python -m hermes_cli web --no-open --port 9119
+```
+
+原理：phalanx 项目根目录天然在 `sys.path`，Python 能直接 import `hermes_cli` 包。**不需要 `pip install`**，改完代码立即生效，没有装包/编辑模式同步问题。适合开发期。
+
+### 选项 B — `pip install -e .`，用 `phalanx` / `hermes` console_script
+
+```bash
+pip install -e .                  # 一次性，注册 console_script
+phalanx oneshot "你好"            # 项目原生命令（推荐）
+hermes oneshot "你好"             # 同一入口，上游 hermes-agent 兼容名
+phalanx eval list
+phalanx web --no-open --port 9119
+```
+
+原理：`pyproject.toml` 在 `[project.scripts]` 注册了三个 entry point：
+
+```
+phalanx       → hermes_cli.main:main      （项目原生，新文档默认用这个）
+hermes        → hermes_cli.main:main      （上游兼容名，老文档 / 上游补丁可继续用）
+hermes-agent  → run_agent:main            （旁路：直调 AIAgent，不经子命令路由）
+```
+
+`phalanx` 和 `hermes` 是同一个入口的两个别名，行为完全一致；`--help` 会按你实际敲的命令名回显（敲 `phalanx --help` 看 `usage: phalanx ...`，敲 `hermes --help` 看 `usage: hermes ...`）。`pip install` 后落到 Python 的 `Scripts/`（Windows）或 `bin/`（Linux/macOS），加进 PATH 即可全局调用。
+
+**前置**：Python ≥ 3.10。
+
+**何时选 B**：装完 phalanx 后想在任意目录里直接 `phalanx ...` / `hermes ...`，或者对 wheel 打包 / CI / 用户分发有要求时。
+
+### 文档约定
+
+新文档优先用 `phalanx ...` 形式（跟项目名 / `~/.phalanx/` / `PHALANX_HOME` 一致）。本文档历史段落用 `hermes ...` 暂时保留以匹配上游 hermes-agent 文本（避免 cherry-pick 噪音）；选项 A 用户把任意 `phalanx <subcmd>` 或 `hermes <subcmd>` 替换成 `python -m hermes_cli <subcmd>` 即可，flag 完全一致。
+
+---
+
 ## 1. 现状对照
 
 ### 1.1 hermes-agent 顶层布局（保留的目录与文件）
@@ -407,15 +453,31 @@ hermes web --token <hex>            # 复用固定 token（CI / 测试场景）
 
 #### 2.7.3 验收
 
+> 下面以 Linux/bash 写。Windows PowerShell 等价形式：用 `Start-Process hermes -ArgumentList ...` 取代尾部 `&`；用 `curl.exe`（带 `.exe`，避开 `curl` 在 PowerShell 里被别名为 `Invoke-WebRequest`）；用 `start` 取代 `xdg-open`。
+
 ```bash
 pytest tests/                                                 # 全过（含 ~30 个新增 web 后端用例）
 cd web && npm run build                                       # 出 ../hermes_cli/web_dist/
 pip install -e .
-hermes web --no-open --port 9119 &                            # 起服务
-curl -s http://127.0.0.1:9119/api/status                      # 401（无 token）
+
+# 起服务（Linux/macOS：尾部 & 后台跑；Windows：换一个 shell / Start-Process）
+hermes web --no-open --port 9119 &
+# 等服务起来
+sleep 1
+
+# 401（无 token）
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:9119/api/status
+
+# 拿 token：`hermes web` 起来时 stdout 会打 "  Session token: <hex>" 一行，存进 HERMES_TOKEN
+# bash:        export HERMES_TOKEN=...
+# PowerShell:  $env:HERMES_TOKEN = "..."
+
+# 200 + sessions 列表
 curl -s -H "X-Hermes-Session-Token: $HERMES_TOKEN" \
-     http://127.0.0.1:9119/api/sessions | jq .                # 200 + 列表
-xdg-open http://127.0.0.1:9119/                                # 浏览器看 SPA，session 列表完整
+     http://127.0.0.1:9119/api/sessions | jq .
+
+# 浏览器看 SPA：Linux=xdg-open / macOS=open / Windows=start
+xdg-open http://127.0.0.1:9119/
 ```
 
 ---
@@ -448,23 +510,50 @@ xdg-open http://127.0.0.1:9119/                                # 浏览器看 SP
 | 3 | Verifier 三种：`exact_match`（assistant 最后回复包含 substring）、`tool_called`（trajectory 里出现指定工具调用）、`file_state`（task 跑完后某路径满足条件）；report 渲染（成功率 / token / 平均轮数 / per-task 详情） | ~300 |
 | 4 | CI 集成：pytest fixture 跑 1-2 个 stub-model golden task 防 regression（真 model eval 在 docs 里写"手动周跑"，不进 CI 节省成本）；reports 落 `~/.phalanx/eval/<timestamp>/` | ~150 |
 
-**CLI 暴露**：
+**CLI 暴露**（wave 4 后全部落地）：
 
 ```bash
 hermes eval                              # 跑全部 golden task，文本报告到 stdout
 hermes eval --task <id>                  # 只跑一个
 hermes eval --json                       # 机器可读输出
-hermes eval --baseline <run-id> --diff   # 跟历史 run 比 regression
+hermes eval --no-save                    # 不持久化（默认每次跑都落到 ~/.phalanx/eval/）
+hermes eval --baseline <run-id>          # 报告末尾追加跟基线的 diff 段
+hermes eval --baseline <run-id> --diff   # 只输出 diff，省掉重复的 per-task 段
 hermes eval list                         # 列已有 golden task
+hermes eval list --runs                  # 列 ~/.phalanx/eval/ 已存档的 run
 ```
+
+**手动周跑（不进 CI）**：
+
+CI 里只跑 `tests/test_eval_ci_smoke.py` 的 stub 验证（runner+verifier+save 链路结构 OK）；真 model eval 因为成本 + 网络抖动留给手动周跑：
+
+```bash
+# 1. 配 API key（首次或换 key 时）
+export OPENAI_API_KEY=sk-...           # 或写到 ~/.phalanx/.env
+export OPENAI_BASE_URL=https://api.openai.com/v1   # 可选，默认就是这个
+
+# 2. 跑全套，落基线（默认存 ~/.phalanx/eval/<timestamp>/）
+hermes eval --json > weekly-2026-W19.json
+
+# 3. 改完代码后再跑，跟上周比
+hermes eval list --runs                              # 拿到上周的 run_id
+hermes eval --baseline 2026-05-06T16-32-33Z --diff   # 看哪些 task 退化 / 多烧 token
+```
+
+每个 run 目录里有 `records.json` / `summary.json` / `tasks.json` / `report.txt`,前两个机器可读,后一个人类可读。
 
 **验收**：
 
 ```bash
-pytest tests/                            # 含 1-2 个 stub-model eval smoke
-hermes eval                              # 真 model 跑 10 task，0 failed
-hermes eval --diff <previous>            # 跟昨天的 run 比"哪 task 多花了 token"
+pytest tests/                                    # 含 stub-model eval smoke (test_eval_ci_smoke.py)
+hermes eval list                                 # 显示 wave-2 的 10 个 golden task
+hermes eval --no-save                            # 真 model 跑 10 task，0 failed（不落盘）
+hermes eval                                      # 真 model 跑 + 落基线到 ~/.phalanx/eval/<ts>/
+hermes eval list --runs                          # 拿到刚落的 run_id
+hermes eval --baseline <run_id> --diff           # 跟刚才的 run 比 verdict / token / cost 增量
 ```
+
+> 没有 API key 时把 `--task smoke_oneshot` 加进去也会失败（loop 调真模型）；纯结构验证走 `pytest tests/test_eval_ci_smoke.py` 即可。
 
 **为什么放第一**：没有 baseline，§2.8.b 的"memory 让 agent 更聪明了吗"无法证明，所有后续优化变成感觉良好的猜测。
 
