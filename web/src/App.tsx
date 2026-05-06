@@ -1,6 +1,8 @@
 import { NavLink, Route, Routes, Navigate } from "react-router-dom";
 
+import { ToastProvider } from "@/components/ui/toast";
 import StatusPage from "@/pages/StatusPage";
+import SessionsPage from "@/pages/SessionsPage";
 import { cn } from "@/lib/utils";
 
 interface NavEntry {
@@ -12,6 +14,7 @@ interface NavEntry {
 // Each §2.8 deliverable adds its NavBar entry alongside its own page.
 const NAV: NavEntry[] = [
   { label: "Status", to: "/status" },
+  { label: "Sessions", to: "/sessions" },
 ];
 
 function NavBar() {
@@ -48,20 +51,23 @@ function NavBar() {
 
 export default function App() {
   return (
-    <div className="min-h-screen">
-      <NavBar />
-      <main className="mx-auto max-w-6xl px-6 py-6">
-        <Routes>
-          <Route path="/" element={<Navigate to="/status" replace />} />
-          <Route path="/status" element={<StatusPage />} />
-          <Route
-            path="*"
-            element={
-              <div className="text-zinc-400">Page not found.</div>
-            }
-          />
-        </Routes>
-      </main>
-    </div>
+    <ToastProvider>
+      <div className="min-h-screen">
+        <NavBar />
+        <main className="mx-auto max-w-6xl px-6 py-6">
+          <Routes>
+            <Route path="/" element={<Navigate to="/status" replace />} />
+            <Route path="/status" element={<StatusPage />} />
+            <Route path="/sessions" element={<SessionsPage />} />
+            <Route
+              path="*"
+              element={
+                <div className="text-zinc-400">Page not found.</div>
+              }
+            />
+          </Routes>
+        </main>
+      </div>
+    </ToastProvider>
   );
 }
