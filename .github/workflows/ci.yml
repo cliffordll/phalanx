@@ -31,6 +31,13 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      - name: Set up Node (for the §2.7 web dashboard)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -38,6 +45,15 @@ jobs:
           # build + twine are CI-only utilities, installed separately.
           pip install -e ".[dev]"
           pip install build twine
+
+      - name: Build web dashboard
+        # Must run before `python -m build` so hermes_cli/web_dist/
+        # exists when setuptools packages it via package-data.
+        # `npm ci` enforces lockfile parity with what's checked in.
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
 
       - name: Lint (ruff)
         run: ruff check .

@@ -61,12 +61,20 @@ hermes-agent = "run_agent:main"
 py-modules = [
   "hermes_constants",
   "hermes_logging",
+  "hermes_state",
   "hermes_time",
   "utils",
 ]
 
 [tool.setuptools.packages.find]
 include = ["agent", "agent.*", "tools", "tools.*", "hermes_cli", "hermes_cli.*"]
+
+# Phase 2.7 wave 6 — ship the built React SPA inside the wheel so
+# `pip install phalanx && hermes web` Just Works without an npm step.
+# Build order: `cd web && npm run build` populates hermes_cli/web_dist/
+# (gitignored), then `python -m build` picks it up via package-data.
+[tool.setuptools.package-data]
+hermes_cli = ["web_dist/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -294,19 +294,88 @@ token 是进程内 module-level 单例，多 worker 各 fork 一份会失配；s
 - 启动时 `webbrowser.open(url)` 默认开浏览器；`--no-open` flag 跳过（CI / SSH）
 - 如 9119 已被占用：报错 + 提示用户传 `--port`，不自动找其他端口（避免静默落到错误端口让用户找不到）
 
-## 5. CLI 暴露面
+## 5. 启动方式
+
+dashboard 有两种典型用法——**日常使用模式**（一条命令起服务）和**前端开发模式**（HMR 边改边看）。
+
+### 5.1 日常使用：`hermes web`
 
 ```bash
-hermes web                                    # :9119, 自动开浏览器
-hermes web --port 8080                        # 自定义端口
-hermes web --no-open                          # 不开浏览器（CI / SSH）
-hermes web --token deadbeef...                # 复用固定 token（CI 测试）
-hermes web --bind 127.0.0.1                   # 默认就是 127.0.0.1，留 flag 备 0.0.0.0 用
+python -m hermes_cli web                       # :9119, 自动开浏览器
+python -m hermes_cli web --port 8080           # 自定义端口
+python -m hermes_cli web --no-open             # 不开浏览器（CI / SSH 场景）
+python -m hermes_cli web --token deadbeef...   # 复用固定 token（CI 测试 / curl）
+python -m hermes_cli web --bind 127.0.0.1      # 默认就是 127.0.0.1，留 flag 备 0.0.0.0 用
 ```
 
-`hermes_cli/main.py:cmd_web(args)` 大致：
+启动时终端会打两行：
+```text
+  Phalanx Web UI → http://127.0.0.1:9119
+  Session token: <随机 token 或 --token 传入的值>
+```
+
+token 在进程启动时一次性生成（`secrets.token_urlsafe(32)`），进程退出即失效。SPA 通过 `mount_spa` 注入到 `index.html` 的 `window.__HERMES_SESSION_TOKEN__`，所以**直接打开浏览器**就能用——不需要手动复制 token。
+
+**前提：`hermes_cli/web_dist/` 必须存在**。仓库 gitignore 了构建产物，所以新克隆后**第一次跑前必须先构建一次前端**：
+
+```bash
+cd web && npm install && npm run build
+```
+
+`npm run build` 输出直接落到 `../hermes_cli/web_dist/`（vite.config.ts 里 hardcoded），后续 `python -m hermes_cli web` 自动 serve 这棵静态树。
+
+如果忘了 build，访问 `/` 会返：
+```json
+{"error": "Frontend not built. Run: cd web && npm run build"}
+```
+
+后端 API 仍然能工作（`/api/status` 等），所以 curl / 脚本测试不受影响。
+
+### 5.2 前端开发模式：Vite HMR + 后端代理
+
+改 React 代码时不想每次都 `npm run build`——分两个终端：
+
+**终端 A — 后端（不开浏览器）：**
+```bash
+python -m hermes_cli web --no-open --port 9119
+```
+
+**终端 B — Vite dev server：**
+```bash
+cd web
+npm run dev
+```
+
+Vite 起在 `http://127.0.0.1:5173`（默认端口），通过 `vite.config.ts` 里配的 proxy 把 `/api/*` 请求转发到 `127.0.0.1:9119`：
+
+```ts
+server: {
+  port: 5173,
+  proxy: { "/api": { target: "http://127.0.0.1:9119" } },
+}
+```
+
+打开 `http://127.0.0.1:5173`（**不是** :9119）看 dev 版本。改 `web/src/**/*.tsx` 保存即热更新；后端改 `hermes_cli/web_server.py` 后 ctrl-C + 重启终端 A 即可。
+
+**dev 模式的 token 注入**：Vite dev server 直接 serve `index.html` 不经过后端 `mount_spa`，所以 `window.__HERMES_SESSION_TOKEN__` 是 undefined，`fetchJSON` 不会注入 header → 任何 protected 端点都返 401。两种解决方案：
+
+1. **临时把 `_PUBLIC_API_PATHS` 加上你正在调的端点**（不推荐，commit 前要还原）
+2. **在 dev 时手动注入 token**：终端 A 用 `--token <fixed>` 启服务，再在浏览器 devtools console 里跑 `window.__HERMES_SESSION_TOKEN__ = "<fixed>"` 然后刷新页面。phalanx 当前 dev 频次低，没自动化这步——`vite-plugin-html` 一类库可以做但增加构建复杂度。
+
+### 5.3 安装后使用（生产场景）
+
+`pip install phalanx-0.0.1-py3-none-any.whl` 之后，wheel 内已携带 `hermes_cli/web_dist/`（wave 6 加进 `package-data`），所以直接：
+
+```bash
+hermes web                                     # console_script 入口，等价于 python -m hermes_cli web
+```
+
+不需要本地 npm，也不需要源码构建——这是发布版本的目标体验。
+
+### 5.4 内部实现
 
 ```python
+# hermes_cli/main.py:cmd_web
 def cmd_web(args):
     from hermes_cli.web_server import start_server
     start_server(
@@ -314,10 +383,11 @@ def cmd_web(args):
         port=args.port,
         token=args.token,           # None → secrets.token_urlsafe(32)
         open_browser=not args.no_open,
+        allow_public=args.insecure,
     )
 ```
 
-`start_server` 内部 `uvicorn.run(app, host=..., port=..., log_level="info")`。
+`start_server` 内部 `uvicorn.run(app, host=..., port=..., log_level="warning")`，单 worker（多 worker 会让 token / SessionDB 状态分裂）。
 
 ## 6. 测试策略
 

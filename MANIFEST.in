@@ -1,2 +1,8 @@
 global-exclude __pycache__
 global-exclude *.py[cod]
+
+# Phase 2.7 wave 6 — built React SPA must travel inside the sdist
+# tarball too, so `pip install phalanx-0.0.1.tar.gz` works without
+# requiring a Node toolchain on the install host.  Build order
+# matches the wheel (npm run build → python -m build).
+recursive-include hermes_cli/web_dist *
