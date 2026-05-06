@@ -34,7 +34,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=9.0.2,<10", "pytest-asyncio>=1.3.0,<2", "ruff"]
+dev = [
+  "pytest>=9.0.2,<10",
+  "pytest-asyncio>=1.3.0,<2",
+  "ruff",
+  # Pre-commit framework — runs ruff (and any future hooks) before each
+  # `git commit`.  Activate with `pre-commit install` after install.
+  "pre-commit>=4.0,<5",
+]
 
 # Entry points — registered when phalanx is `pip install -e .`
 # `hermes` and `hermes-agent` names are kept identical to upstream so that

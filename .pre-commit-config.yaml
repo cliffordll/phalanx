@@ -1,0 +1,18 @@
+# Pre-commit hooks — run on staged files before each `git commit`.
+#
+# Setup:
+#   pip install -e ".[dev]"          # installs pre-commit (declared in pyproject.toml)
+#   pre-commit install                # registers .git/hooks/pre-commit
+#
+# Manual run on the entire repo:
+#   pre-commit run --all-files
+#
+# Skip hooks for one commit (rarely needed):
+#   git commit --no-verify -m "..."
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.10
+    hooks:
+      # Lint with auto-fix (matches CI's `ruff check .` but adds --fix locally).
+      - id: ruff-check
+        args: [--fix]
