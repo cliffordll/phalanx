@@ -1,7 +1,16 @@
 # Phalanx 架构说明（current state）
 
 > 本文描述**当前已实现**的代码结构与运行时数据流；与之配对的**前瞻规划**见 [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md)。
-> 当前进度：Phase 2.2 全部 5 wave 完成（file/todo/web/result-storage 工具齐备），可用 Ollama / OpenAI 兼容端点跑完整工具链。已注册 9 个工具：`echo` `read_file` `write_file` `patch` `search_files` `terminal` `todo` `web_search` `web_extract`。
+> 各 phase 的设计推导见独立设计文档：
+> - [`phase-2.0-skeleton.md`](phase-2.0-skeleton.md) — 项目骨架 + 方案 B env 隔离
+> - [`phase-2.1-minimal-loop.md`](phase-2.1-minimal-loop.md) — `AIAgent` 最小 loop + 最小 CLI + tool registry
+> - [`phase-2.2-tools.md`](phase-2.2-tools.md) — 真实工具栈落地（file / todo / web / result-storage）
+> - [`phase-2.3-prompt-context.md`](phase-2.3-prompt-context.md) — prompt 系统 / API retry / model metadata / pricing / trajectory
+> - [`phase-2.4-multi-provider.md`](phase-2.4-multi-provider.md) — anthropic / codex provider + 流式 + `_make_api_call` 分发器
+> - [`phase-2.5-sessions.md`](phase-2.5-sessions.md) — `SessionDB` / `--resume` / session CLI / logs
+> - [`phase-2.6-repl.md`](phase-2.6-repl.md) — prompt_toolkit REPL + 斜杠命令 + tips
+>
+> 当前进度：**Phase 2.6 wave 3 完成**——交互式 REPL（prompt_toolkit + 斜杠命令 + 流式渲染）+ SessionDB 持久化 + multi-provider（OpenAI / Anthropic / Codex Responses）+ 流式输出 + 9 个内置工具齐备。已注册工具：`echo` `read_file` `write_file` `patch` `search_files` `terminal` `todo` `web_search` `web_extract`。
 
 ## 1. 一图看懂
 
@@ -18,17 +27,19 @@
                                                      ▼
                                         ┌───────────────────────────────┐
                                         │  cli.py:main(...)              │
-                                        │   plain-text REPL or oneshot  │
+                                        │  §2.6 prompt_toolkit REPL or  │
+                                        │  oneshot                      │
                                         └────────────┬──────────────────┘
                                                      │  AIAgent(...)
                                                      ▼
    ┌──── per-turn loop ────────────────────────────────────────────────────┐
    │                                                                       │
    │  ┌────────────────┐    1. build api_kwargs   ┌─────────────────────┐  │
-   │  │ AIAgent        │ ────────────────────────►│  OpenAI lazy proxy  │  │
-   │  │ run_conversa-  │                           │  (chat completions)│  │
-   │  │ tion()         │ ◄──── 2. response ───────│                     │  │
-   │  └──────┬─────────┘                           └─────────────────────┘  │
+   │  │ AIAgent        │ ────────────────────────►│  _make_api_call     │  │
+   │  │ run_conversa-  │                           │  dispatcher (§2.4): │  │
+   │  │ tion()         │ ◄──── 2. response ───────│  openai/anthropic/  │  │
+   │  └──────┬─────────┘                           │  codex responses    │  │
+   │         │                                     └─────────────────────┘  │
    │         │ 3. dispatch tool_calls                                       │
    │         ▼                                                              │
    │  ┌────────────────┐                          ┌─────────────────────┐  │
@@ -58,19 +69,34 @@ phalanx/
 ├── README.md                       项目入口指引
 │
 ├── run_agent.py                    AIAgent + IterationBudget + OpenAI 代理 + def main 旁路 CLI
-├── cli.py                          交互式 REPL 实现（被 hermes_cli/main 委托）
+├── cli.py                          §2.6 prompt_toolkit REPL（被 hermes_cli/main 委托）
 ├── hermes_constants.py             路径/平台常量（PHALANX_HOME 等）
 ├── hermes_logging.py               日志工厂（session_tag、redact、rotation）
 ├── hermes_time.py                  时区辅助（PHALANX_TIMEZONE）
+├── hermes_state.py                 §2.5 SessionDB：SQLite 会话持久化（schema + CRUD + resume）
 ├── utils.py                        atomic_*_write、env helpers、URL 解析
 │
 ├── agent/                          AIAgent 内部支持模块
 │   ├── __init__.py
-│   ├── retry_utils.py              jittered_backoff
-│   ├── error_classifier.py         classify_api_error / FailoverReason
+│   ├── retry_utils.py              jittered_backoff（§2.1）
+│   ├── error_classifier.py         classify_api_error / FailoverReason（§2.1）
 │   ├── file_safety.py              get_read_block_error（§2.2 wave 1）
 │   ├── redact.py                   redact_sensitive_text（§2.2 wave 1）
-│   └── auxiliary_client.py         §2.2 wave 4 shim（4 个符号，3914→91 行）
+│   ├── auxiliary_client.py         §2.2 wave 4 shim（4 个符号，3914→89 行）
+│   │
+│   │  ── §2.3：prompt 系统 + model 元数据 ──
+│   ├── prompt_builder.py           system prompt 渲染 + 注入
+│   ├── prompt_caching.py           Anthropic prompt cache 控制
+│   ├── memory_manager.py           §2.3 wave 3 shim（StreamingContextScrubber 等）
+│   ├── context_compressor.py       §2.3 wave 3 shim（compress 入口）
+│   ├── subdirectory_hints.py       SubdirectoryHintTracker
+│   ├── model_metadata.py           模型能力查询（max_tokens / 工具支持等）
+│   ├── usage_pricing.py            estimate_usage_cost / normalize_usage
+│   ├── trajectory.py               turn-level trajectory 记录
+│   │
+│   │  ── §2.4：multi-provider ──
+│   ├── anthropic_adapter.py        anthropic Messages API 适配
+│   └── codex_responses_adapter.py  codex Responses API 适配（OpenAI o-series）
 │
 ├── tools/                          工具系统
 │   ├── __init__.py                 静态 import 触发各工具自注册
@@ -101,26 +127,40 @@ phalanx/
 │   │
 │   │  ── §2.2 wave 5：context budget ──
 │   ├── budget_config.py            BudgetConfig + DEFAULT_RESULT_SIZE_CHARS
-│   └── tool_result_storage.py      maybe_persist_tool_result + enforce_turn_budget
+│   ├── tool_result_storage.py      maybe_persist_tool_result + enforce_turn_budget
+│   │
+│   │  ── §2.4：tool schema 兼容层 ──
+│   └── schema_sanitizer.py         provider 间 JSON Schema 差异修平
 │
 ├── hermes_cli/                     CLI 入口与子命令
 │   ├── __init__.py                 __version__ + Windows utf-8 setup
 │   ├── __main__.py                 python -m hermes_cli 入口
-│   ├── main.py                     argparse 分发器，8 个子命令
+│   ├── main.py                     argparse 分发器（oneshot/chat/tools/config/version/doctor/session/logs）
 │   ├── _parser.py                  argparse 辅助（来自 upstream）
 │   ├── env_loader.py               load_hermes_dotenv：~/.phalanx/.env + 项目 .env
 │   ├── config.py                   cfg_get / cfg_set / load_config / save_config
 │   ├── timeouts.py                 get_provider_request_timeout 等
 │   ├── banner.py                   ASCII art / 版本横幅
 │   ├── colors.py                   ANSI 色码常量
-│   └── cli_output.py               print 包装、密码读取
+│   ├── cli_output.py               print 包装、密码读取
+│   ├── commands.py                 §2.6 wave 2：CommandDef + COMMAND_REGISTRY + SlashCommandCompleter
+│   ├── tips.py                     §2.6 wave 3：21 条 REPL 启动提示
+│   └── logs.py                     §2.5 wave 5：hermes logs 子命令
 │
-├── tests/                          pytest 套件
+├── tests/                          pytest 套件（约 130 用例）
 │   ├── __init__.py
-│   ├── conftest.py                 StubClient + stub_openai fixture + reset_echo_call_count
-│   ├── test_minimal_loop.py        18 个用例覆盖 IterationBudget / __init__ / run_conversation / 工具序列化
-│   ├── test_cli_oneshot.py         10 个用例覆盖 version/doctor/config/oneshot/--debug
-│   └── test_cli_tools.py            7 个用例覆盖 tools list/run/错误分支
+│   ├── conftest.py                 StubClient + stub_openai + reset_echo_call_count
+│   ├── test_minimal_loop.py        §2.1 — 18 用例：IterationBudget / __init__ / run_conversation / 工具序列化
+│   ├── test_cli_oneshot.py         §2.1 — 10 用例：version/doctor/config/oneshot/--debug
+│   ├── test_cli_tools.py           §2.1+§2.2 — 15 用例：tools list/run/schema/dry-run
+│   ├── test_session_db.py          §2.5 wave 1 — SessionDB CRUD
+│   ├── test_session_db_integration.py §2.5 wave 2 — run_conversation 持久化集成
+│   ├── test_cli_resume.py          §2.5 wave 3 — --resume CLI flag
+│   ├── test_cli_session.py         §2.5 wave 4 — session list/show/dump/delete
+│   ├── test_cli_logs.py            §2.5 wave 5 — logs 子命令
+│   ├── test_cli_repl.py            §2.6 wave 1 — REPL 路径 smoke
+│   ├── test_cli_commands.py        §2.6 wave 2 — CommandDef / completer / dispatch alias
+│   └── test_cli_handlers.py        §2.6 wave 3 — 34 用例：每个 _cmd_* handler + 流式 _run_turn
 │
 ├── docs/
 │   ├── ARCHITECTURE.md             本文
@@ -136,9 +176,13 @@ phalanx/
 
 | 文件 | 职责 | 行数 | 上游对照 |
 |---|---|---:|---|
-| `run_agent.py` | `AIAgent` orchestrator、`IterationBudget`、`OpenAI` lazy proxy、`def main` 旁路 CLI | ~700 | upstream 14123 行裁剪 |
-| `cli.py` | 富 REPL 实现（Phase 1 用朴素 `input()`，Phase 6 上 prompt_toolkit） | ~216 | upstream 12043 行裁剪 |
-| `hermes_cli/main.py` | argparse 顶层分发；与上游一致的 flat 结构（global flag 在 top-level，子命令各自重定义需要的 flag） | ~440 | upstream 10439 行裁剪 |
+| `run_agent.py` | `AIAgent` orchestrator、`IterationBudget`、`OpenAI` lazy proxy、`_make_api_call` provider 分发器、`def main` 旁路 CLI | ~1200 | upstream 14123 行裁剪 |
+| `cli.py` | §2.6 prompt_toolkit REPL：`PromptSession` + `FileHistory(~/.hermes/cli_history)` + `SlashCommandCompleter` + `patch_stdout` 流式渲染 + 11 个斜杠 handler | ~580 | upstream 12043 行裁剪 |
+| `hermes_cli/main.py` | argparse 顶层分发：`oneshot` / `chat` / `tools` / `config` / `version` / `doctor` / `session` / `logs` 8 子命令；flat 结构（global flag 在 top-level） | ~700 | upstream 10439 行裁剪 |
+| `hermes_state.py` | §2.5 `SessionDB`：SQLite schema + `add_message` / `set_session_title` / `list_sessions` / `get_messages_as_conversation` / `resolve_session_id` / `reopen_session` 等 9+ CRUD | ~1300 | upstream 2248 行裁剪 |
+| `hermes_cli/commands.py` | §2.6 `CommandDef` dataclass + `COMMAND_REGISTRY`（裁剪到 ~18 项）+ `resolve_command` + `SlashCommandCompleter` | ~270 | upstream ~700 行裁剪（去掉 telegram/discord/slack/gateway 命令） |
+| `hermes_cli/tips.py` | §2.6 wave 3：21 条 REPL 启动随机提示 | 60 | verbatim 裁剪 |
+| `hermes_cli/logs.py` | §2.5 wave 5：`hermes logs <session_id> [--follow] [--level]` | ~150 | phalanx minimal |
 | `tools/registry.py` | `ToolRegistry` 单例、`ToolEntry`、register/dispatch/`get_definitions`/`get_all_tool_names`/`get_schema`/`get_toolset_for_tool` | ~547 | near-verbatim（model_tools 1 处 lazy fallback；budget_config 已对齐上游） |
 | `tools/echo_tool.py` | smoke 工具，自注册 `echo` | ~83 | phalanx 专属 |
 | `tools/file_tools.py` | `read_file` / `write_file` / `patch` / `search_files` 入口；resolve_path、device 黑名单、二进制守卫、敏感路径检查 | 1143 | verbatim |
@@ -156,9 +200,19 @@ phalanx/
 | `tools/tool_result_storage.py` | `maybe_persist_tool_result`（layer 2 单结果落盘）+ `enforce_turn_budget`（layer 3 整轮预算）+ `<persisted-output>` preview block 构造 | 226 | verbatim |
 | `agent/file_safety.py` | `get_read_block_error`：拒绝某些路径的读，给模型清晰指引 | 111 | verbatim |
 | `agent/redact.py` | `redact_sensitive_text`：从工具返回里抹掉 token / API key / SSN 等敏感字串 | 394 | verbatim |
-| `agent/auxiliary_client.py` | LLM 摘要客户端（OpenRouter Gemini 等）；shim 让 web_tools 走"返回原文"降级路径 | 91 | phalanx minimal shim（upstream 3914 行） |
+| `agent/auxiliary_client.py` | LLM 摘要客户端（OpenRouter Gemini 等）；shim 让 web_tools 走"返回原文"降级路径 | 89 | phalanx minimal shim（upstream 3914 行） |
 | `agent/retry_utils.py` | `jittered_backoff(attempt)` | 57 | verbatim |
 | `agent/error_classifier.py` | `classify_api_error(error, ...)` + `FailoverReason` enum | 1000 | verbatim |
+| `agent/prompt_builder.py` | §2.3：system prompt 渲染、注入、节点拼接 | — | verbatim |
+| `agent/prompt_caching.py` | §2.3：Anthropic prompt cache 控制（cache_control 标记） | — | verbatim |
+| `agent/memory_manager.py` / `context_compressor.py` | §2.3 wave 3 shim：保留 `StreamingContextScrubber` / `compress` 等公开符号，body no-op | — | phalanx shim |
+| `agent/subdirectory_hints.py` | `SubdirectoryHintTracker`：跨 turn 追踪用户工作目录的语义提示 | — | verbatim |
+| `agent/model_metadata.py` | 模型能力查询（`max_tokens` / 工具支持 / 流式支持）+ provider 推断 | — | verbatim |
+| `agent/usage_pricing.py` | `estimate_usage_cost` / `normalize_usage` | — | verbatim |
+| `agent/trajectory.py` | turn-level trajectory 记录（每轮 prompt / tool_calls / tokens） | — | verbatim |
+| `agent/anthropic_adapter.py` | §2.4 wave 2：Anthropic Messages API 适配（消息 format 转换 + 流式 delta 拼装） | — | verbatim |
+| `agent/codex_responses_adapter.py` | §2.4 wave 5：OpenAI o-series Responses API 适配（reasoning summary + 流式 chunk） | — | verbatim |
+| `tools/schema_sanitizer.py` | §2.4：跨 provider 的 JSON Schema 兼容修平（去掉 anthropic 不支持的字段等） | — | verbatim |
 | `hermes_constants.py` | `get_hermes_home`、`get_config_path`、`is_termux/is_wsl/is_container` | 345 | verbatim + 方案 B 路径/env 改名 |
 | `hermes_logging.py` | `setup_logging`、`set_session_context`、`_install_session_record_factory` | 389 | verbatim |
 | `hermes_time.py` | `now()` 时区感知 datetime | 104 | verbatim + env 改名 |
@@ -256,29 +310,11 @@ class IterationBudget:
 
 每跑一轮 `chat.completions` 就 `consume()` 一次；用完则主循环退出，`stop_reason="budget_exhausted"`。一轮 = 一次模型 HTTP + 0~N 次工具调用，整体只扣 1 格。
 
-**为什么单独抽出来当一个类**：
+`__init__` 提供 `iteration_budget: Optional[IterationBudget]` 参数：子 agent 派生时**把父级实例直接传过去**所有 agent 共享同一个计数器，`threading.Lock` 保证跨线程安全。`self.max_iterations` 是当前实例硬上限，`self.iteration_budget` 是可继承预算池——主循环条件两者都要满足，谁先到先停。
 
-1. **防止失控的工具循环烧爆 API**。模型偶尔陷入"调 search → 看不懂 → 再调一次"的死循环。`max_iterations=90` 是硬天花板，触发后状态机进 `budget_exhausted` 分支，给用户返回部分结果而不是无限等待。
+phalanx 当前还没移植 `delegate_task`，每个 `AIAgent` 都自己 new 一个 `IterationBudget`，等价于一个简单的 90 轮上限；接口已经留好——后续接入子 agent 派生时一行传参就接通。返回值 `iterations_used`（`run_agent.py:652`）向调用方透出实际烧了几轮，便于成本观测。
 
-2. **可继承的全局额度**（关键设计）。`__init__` 提供 `iteration_budget: Optional[IterationBudget]` 参数：未来 §2.4+ 引入 `delegate_task` 工具，主 agent 派生子 agent 干独立活时，**把父级实例直接传过去**，所有 agent 共享同一个计数器：
-
-   ```python
-   sub = AIAgent(..., iteration_budget=parent.iteration_budget)
-   ```
-
-   否则一个主 agent + 5 个子 agent 各自 new 一个 `IterationBudget(90)` 等于把 cap 抬到 540 轮，硬天花板形同虚设。`threading.Lock` 也是为这种并发场景准备的。
-
-3. **重试不重复扣费**。API 失败重试时（`run_agent.py:493`），看 `iteration_budget.remaining == 0` 决定要不要继续重试，必要时 `refund()`。一次成功响应只扣一格。
-
-**与 `max_iterations` 的关系**：
-
-- `self.max_iterations`：本次 AIAgent 实例自己的硬上限。
-- `self.iteration_budget`：可跨实例共享的预算池。
-- 主循环条件 `&&`：两个都要满足。子 agent 既受自己 `max_iterations` 限制，也受继承下来的父预算限制——谁先到先停。
-
-**当前阶段的实际行为**：phalanx 还没移植 `delegate_task`，每个 `AIAgent` 都自己 new 一个 `IterationBudget`，等价于一个简单的 90 轮上限。但接口已经留好——后续接入子 agent 派生时，传 `iteration_budget=parent.iteration_budget` 就能跑共享预算，零结构变更。
-
-返回值 `iterations_used`（`run_agent.py:652`）会向调用方透出实际烧了几轮，便于成本观测。
+> 设计推导（为什么独立成类、防失控循环、可继承全局额度、重试不重复扣费）见 [`phase-2.1-minimal-loop.md`](phase-2.1-minimal-loop.md) §2。
 
 ## 5. 工具系统
 
@@ -343,6 +379,8 @@ AIAgent.run_conversation
 - `discover_builtin_tools()`：upstream 用 AST 自动扫 `tools/*.py` 是否含 `registry.register(...)` 顶层调用。phalanx 用静态 import 替代——更明确，但加新工具要改 `__init__.py`。
 - 派生 / delegate：`delegate_task` 工具（fork 子 agent）尚未引入。`AIAgent.iteration_budget` 已经设计为可继承（见 §4.1），等 §2.4+ 接入即可零结构变更地共享预算。
 
+> 静态 import vs 上游 AST discover、两处 lazy fallback、`check_fn` TTL 缓存的设计推导见 [`phase-2.1-minimal-loop.md`](phase-2.1-minimal-loop.md) §3。
+
 ## 6. 配置与环境
 
 ### 三层覆盖
@@ -385,17 +423,27 @@ CLI 启动时由 `_load_dotenv_best_effort()` 自动调用一次。
 hermes [<global flags>] <subcmd> [<subcmd flags>] [<positional>]
 
 global flags（top-level only，子命令前）:
-   --debug   --quiet   --model   --base-url   --api-key
+   --debug   --quiet   --model   --base-url   --api-key   --provider   --resume
 
 subcommands:
-   oneshot     <message>     [--message …] [--system …] [--max-iterations N] [--max-tokens N]
-   chat                       [--system …] [--max-iterations N]
+   oneshot     <message>     [--system …] [--max-iterations N] [--max-tokens N] [--stream]
+   chat                       [--system …] [--max-iterations N]                    # → cli.py REPL
    tools list                 [--verbose]
-   tools run   <name>         --args '<json>'
+   tools run    <name>        --args '<json>'
+   tools schema <name>                                                              # §2.2 wave 6
+   tools dry-run <name>       --args '<json>'                                       # §2.2 wave 6
+   session list               [--limit N]                                           # §2.5 wave 4
+   session show  <id-prefix>
+   session dump  <id-prefix>  [--format json|text]
+   session delete <id-prefix>
+   logs         <id-prefix>   [--follow] [--level INFO|DEBUG]                       # §2.5 wave 5
    config show
-   config get  <dot.key>
+   config get   <dot.key>
    version
    doctor
+
+REPL 内斜杠命令（§2.6 wave 3）:
+   /help /clear /new /history /quit /exit /model /tools /debug /save /resume
 ```
 
 **位置敏感**：因为 upstream 不用 `parents=[]` 给子命令注入 global flag，phalanx 也保持 flat。结果：
@@ -407,6 +455,8 @@ hermes oneshot --debug "..."        ✗  argparse: unrecognized argument
 
 `hermes_cli/main.py:cmd_chat` 通过 `from cli import main as cli_main` 委托 `cli.py`，复刻 upstream `hermes_cli/main.py:1313` 的调用模式。
 
+> flat argparse 的撤销决策（为何放弃 `parents=[common]` 给子命令注入全局 flag、cherry-pick 友好 vs UX 友好的取舍）见 [`phase-2.1-minimal-loop.md`](phase-2.1-minimal-loop.md) §5.3。
+
 ## 8. 三个入口
 
 | 入口 | 文件 | 调用模式 | 用途 |
@@ -417,17 +467,25 @@ hermes oneshot --debug "..."        ✗  argparse: unrecognized argument
 
 ## 9. 测试策略
 
-| 文件 | 用例数 | 关键 fixture / 模式 |
+| 文件 | 引入 phase | 关键 fixture / 模式 |
 |---|---|---|
-| `tests/conftest.py` | （fixture 库） | `stub_openai(responses) → StubClient`：monkeypatch `run_agent.OpenAI` 为返回固定 response 的工厂；`reset_echo_call_count` autouse 清隔离 |
-| `tests/test_minimal_loop.py` | 18 | IterationBudget 单元、AIAgent 构造、run_conversation 全闭环（mock 模型 + 真 registry + 真 echo handler） |
-| `tests/test_cli_oneshot.py` | 10 | argparse 入口、doctor、config show/get、oneshot 单 turn / 双 turn / 缺 message / `--debug` 输出 |
-| `tests/test_cli_tools.py` | 7 | tools list 默认/verbose、tools run 标准/uppercase/JSON 错/非 object/未知工具 |
+| `tests/conftest.py` | §2.1 | `stub_openai(responses) → StubClient`：monkeypatch `run_agent.OpenAI` 为返回固定 response 的工厂；`reset_echo_call_count` autouse 清隔离 |
+| `tests/test_minimal_loop.py` | §2.1 | IterationBudget 单元、AIAgent 构造、run_conversation 全闭环（mock 模型 + 真 registry + 真 echo handler） |
+| `tests/test_cli_oneshot.py` | §2.1 | argparse 入口、doctor、config show/get、oneshot 单 turn / 双 turn / 缺 message / `--debug` 输出 |
+| `tests/test_cli_tools.py` | §2.1 + §2.2 | tools list/run 标准+错误分支、§2.2 wave 6 加 schema/dry-run 验证（含 dry-run 不写盘断言） |
+| `tests/test_session_db.py` | §2.5 wave 1 | `SessionDB` schema 创建、9 个 CRUD 方法、content 编码 / 重新打开 |
+| `tests/test_session_db_integration.py` | §2.5 wave 2 | `run_conversation` 走 SessionDB 持久化端到端、消息批量 flush |
+| `tests/test_cli_resume.py` | §2.5 wave 3 | `--resume <id>` 恢复历史、id 前缀解析 |
+| `tests/test_cli_session.py` | §2.5 wave 4 | `session list/show/dump/delete` |
+| `tests/test_cli_logs.py` | §2.5 wave 5 | `logs <id>` + `--follow` + `--level` 过滤 |
+| `tests/test_cli_repl.py` | §2.6 wave 1 | REPL skeleton smoke、prompt_toolkit 退到 `input()` 路径 |
+| `tests/test_cli_commands.py` | §2.6 wave 2 | `CommandDef` lookup、`SlashCommandCompleter` 补全、dispatch alias 解析 |
+| `tests/test_cli_handlers.py` | §2.6 wave 3 | 34 用例：每个 `_cmd_*` handler + 流式 `_run_turn` + tips picker |
 
 跑法：
 
 ```bash
-pytest tests/                     # 全过 1.2s
+pytest tests/                     # 全过 ~3s（约 130 用例）
 pytest tests/ -v                  # verbose
 pytest tests/test_minimal_loop.py::test_loop_dispatches_real_echo_tool   # 单条
 ```
@@ -455,7 +513,23 @@ git apply --3way patch.diff
 sed -i 's/HERMES_HOME/PHALANX_HOME/g; s/~\/\.hermes/~\/\.phalanx/g; s/HERMES_TIMEZONE/PHALANX_TIMEZONE/g' <(grep -rl HERMES_ phalanx/)
 ```
 
-## 11. 常见操作速查
+## 11. 演进时间线
+
+phalanx 从空仓走到当前状态的所有 phase / wave 与对应 commit + 设计文档：
+
+| Phase | 范围 | 关键 commits | 设计文档 |
+|---|---|---|---|
+| 2.0 | 项目骨架 + 方案 B env 隔离 + CI 工作流 | `ba41f00` `fdac96e` `32e24f1` `fd2ab63` | [`phase-2.0-skeleton.md`](phase-2.0-skeleton.md) |
+| 2.1 | minimal AIAgent loop + 8 子命令 CLI + tool registry + echo + 35 测试 + flat argparse | `c76818d` `d326985` `3cf7e2f` `8236a32` `6660eb1` | [`phase-2.1-minimal-loop.md`](phase-2.1-minimal-loop.md) |
+| 2.2 | 真实工具栈（file/todo/web/terminal）+ tool_result_storage 三层防御 + tool-exec 对齐上游 + tools schema/dry-run | `cbd8281` `7879dd6` | [`phase-2.2-tools.md`](phase-2.2-tools.md) |
+| 2.3 | prompt 系统 + API retry + model metadata + usage pricing + trajectory + memory/compressor shim + prompt CLI | `36c933a` `2a2486c` `e3ab035` `5dad136` | [`phase-2.3-prompt-context.md`](phase-2.3-prompt-context.md) |
+| 2.4 | 流式 + provider CLI + anthropic adapter + codex Responses API + `_make_api_call` 分发器 | `7bcae52` `33572f6` `62092e6` `e0eefa2` `bc809db` | [`phase-2.4-multi-provider.md`](phase-2.4-multi-provider.md) |
+| 2.5 | `SessionDB` + `--resume` + session list/show/dump/delete CLI + logs 子命令 | `c42a4fe` `684154d` `cff4ad9` `6315549` `2aee4b5` `8605df3` | [`phase-2.5-sessions.md`](phase-2.5-sessions.md) |
+| 2.6 | prompt_toolkit REPL + slash command registry + 11 个 handler + tips + 流式 patch_stdout | `c76ac2e` `b9523fd` `fb5c265` `b5a2f64` | [`phase-2.6-repl.md`](phase-2.6-repl.md) |
+
+每份设计文档的 §0 都有当 phase 内 wave 级别的更细粒度 commit 表。
+
+## 12. 常见操作速查
 
 ```bash
 # 配置 + smoke
@@ -480,113 +554,24 @@ ruff check .
 python -m build       # → dist/phalanx-0.0.1-py3-none-any.whl + .tar.gz
 ```
 
-## 12. 已知限制（Phase 2.3+ 解锁）
+## 13. 已知限制（Phase 2.7+ 解锁）
 
-- 不支持流式响应；`stream_callback` 参数已签收但当前不实现（§2.4）
-- 不支持 anthropic / bedrock / codex / gemini provider；只走 OpenAI 兼容 chat completions（§2.4）
-- 不持久化对话历史；REPL 重启后即清空（§2.5）
-- 没有 prompt 缓存 / context compression / memory manager（§2.3 / §2.7）
-- API key 仍只能从 env / .env 取，config.yaml 不读（待 §2.7 credential pool）
-- `cmd_tools_run --args` 在 Windows PowerShell 下因 shell 引号剥离需用 `\"` 转义；`--args-file` / stdin 通道未实现
-- **web_tools 的 LLM 摘要降级**：`agent/auxiliary_client.py` 是 91 行 shim（上游 3914 行），导致大网页只回退到 truncated 原文，不做 Gemini/OpenRouter 摘要——上游 client 移植后自动恢复
+§2.6 wave 3 之后已经解锁的能力：流式响应（§2.4 wave 1）、anthropic / codex provider（§2.4 wave 2-6）、对话历史持久化与 `--resume`（§2.5）、prompt cache（§2.3 wave 2）、prompt_toolkit REPL 与斜杠命令（§2.6）。当前剩余的限制：
+
+- **REPL stub 命令**：`/retry` `/undo` `/title` `/branch` `/compress` `/yolo` `/reasoning` `/personality` 注册了 def 但 handler 打 `not yet implemented`；用户可见但调用无效，详见 [`phase-2.6-repl.md`](phase-2.6-repl.md) §3.1
+- **`@file:` / `@diff` / `@url:` reference**：上游 `SlashCommandCompleter` 里的附件路径补全完全没移
+- **session title 系统**：`/save <title>` 路径走 stub；`set_session_title` 未实现，唯一索引冲突回退（"foo (2)"）也未做
+- **memory / context_compressor**：`agent/memory_manager.py` 与 `agent/context_compressor.py` 是 shim，运行时 no-op；§2.7+ 移植
+- **guardrails / steer / checkpoint / skill**：未引入；上游 `tool_guardrails` / `steer` / `checkpoint_manager` / `skills_*` 全推后续 phase
+- **API key 仅 env/.env**：`config.yaml` 不读 API key；待 §2.7 credential pool
+- **`cmd_tools_run --args`** 在 Windows PowerShell 下因 shell 引号剥离需用 `\"` 转义；`--args-file` / stdin 通道未实现
+- **web_tools 的 LLM 摘要降级**：`agent/auxiliary_client.py` 是 89 行 shim（上游 3914 行），大网页回退到 truncated 原文不做 Gemini/OpenRouter 摘要——上游 client 移植后自动恢复
 - **terminal_tool 后端单一**：仅支持 `env_type='local'`；docker / ssh / modal / daytona / vercel_sandbox 待后续 phase
 - **delegate_task 未引入**：子 agent 派生还未实现，但 `iteration_budget` 接口已为共享预算预留（见 §4.1）
+- **多模态 / 语音 / 浏览器工具**：`/image` `/paste` `/voice` `/browser` 等 §2.7+ 子系统全部未引入
 
-剩余里程碑见 [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) §2.3–§2.7。
+剩余里程碑见 [`MIGRATION_PLAN.md`](MIGRATION_PLAN.md) §2.7 与各 phase 的"留给后续"小节。
 
-## 13. §2.2 关键设计
+## 14. §2.2 关键设计
 
-§2.2 不只是"把工具搬过来"，里面有几处非平凡的工程决策值得单独记录。
-
-### 13.1 tool_result_storage 的三层防御
-
-工具返回大输出（一次 search 命中 1000 行、一次 read_file 50KB）会迅速吃掉模型 context。`tools/tool_result_storage.py` 用三层防御逐级拦截：
-
-| 层 | 入口 | 触发条件 | 行为 |
-|---|---|---|---|
-| 1 — per-tool cap | 工具自己 | 工具内部判断（如 search 截到 100 条） | 工具返回前先截断；唯一工具作者能控的层 |
-| 2 — per-result persist | `maybe_persist_tool_result` | 单结果 > `registry.get_max_result_size(tool_name)`（默认 100 KB） | 通过 `env.execute()` 把全文写入沙箱 `/tmp/hermes-results/{tool_use_id}.txt`，模型只看到 1.5 KB preview + `<persisted-output>` 块带文件路径，可用 `read_file` 按需读片段 |
-| 3 — per-turn budget | `enforce_turn_budget` | 一轮所有工具结果之和 > 200 KB | 按已用字符降序，把最大的未持久化结果继续 spill 到沙箱，直到 aggregate 落到 budget 以下 |
-
-接入位置在 `run_agent.py:_dispatch_tool_call` 之后逐工具包一层（layer 2），整轮 for 循环结束后调一次 `enforce_turn_budget`（layer 3）。layer 1 在每个工具的 handler 内部各自处理。
-
-PINNED_THRESHOLDS 把 `read_file` 的阈值钉死为 `inf`——避免"persist→read→persist"无限循环。
-
-### 13.2 LocalTerminalEnv 的 Windows ARG_MAX 适配
-
-`tool_result_storage._write_to_sandbox` 用 heredoc 把内容塞进单条 shell 命令：
-
-```bash
-mkdir -p /tmp/hermes-results && cat > /tmp/hermes-results/abc.txt << 'HERMES_PERSIST_EOF'
-<整个工具输出，可能 200 KB>
-HERMES_PERSIST_EOF
-```
-
-Linux ARG_MAX ≥ 2 MB，毫无压力。**Windows `CreateProcess` 命令行限制是 32 767 字符**——等于上游设计在 Windows 上对超过 16 KB 的结果直接退化到 inline truncate（preview 1.5 KB），让 Wave 5 在主开发平台失效。
-
-`tools/terminal_tool.py:LocalTerminalEnv.execute` 加了透明适配：
-
-```python
-if os.name == "nt" and len(command) > _LONG_CMD_THRESHOLD:   # 16 KB
-    # spill 到临时 .sh 文件，bash <file> 执行，finally 删掉
-    fd, spill_path = tempfile.mkstemp(prefix="phalanx-cmd-", suffix=".sh")
-    ...
-    argv = [_BASH_PATH, spill_path]
-```
-
-对 verbatim 的 `tool_result_storage.py` 完全透明——不需要修改 verbatim 上游代码就能在 Windows 跑通沙箱写入。Linux/macOS 路径走 `os.name != "nt"` 分支，零开销。
-
-### 13.3 TodoStore 的会话级共享
-
-`tools/todo_tool.py` 的 `TodoStore` 是一个 in-memory 列表，**实例由 AIAgent 持有，跨工具调用共享**。这意味着：
-
-```
-turn 1：todo write → TodoStore = [task1, task2, task3]
-turn 2：read_file → 不影响 TodoStore
-turn 3：todo read  → 拿回 [task1, task2, task3]   ✓
-```
-
-实现上靠 `registry.dispatch(name, args, **kwargs)` 透传 `store=self._todo_store`，handler 收到 `**kw` 后 `kw.get("store")` 取出。这是工具系统里**第一个**需要 per-session 状态的工具，也是为什么 `dispatch` 签名长成 `(name, args, **kwargs)` 而不是 `(name, args)`——为后续这种带状态的工具留接口。
-
-CLI `tools run todo` 路径不经过 AIAgent，所以 `hermes_cli/main.py:cmd_tools_run` 检测到 `args.name == "todo"` 时会**临时 new 一个 TodoStore**，让 smoke test 能跑（每次进程重启即清空，符合预期）。
-
-### 13.4 auxiliary_client 的"返回原文"降级路径
-
-上游 `agent/auxiliary_client.py` 3914 行——是一个独立的 LLM 客户端，专门用来对 web_extract 抓回的网页做 markdown 摘要。phalanx Wave 4 不想跟上游 OpenRouter / 凭据池一起搬，于是写了 91 行 shim：
-
-```python
-def get_async_text_auxiliary_client(task: str = "", *, ...):
-    return None, None    # ← 关键
-```
-
-`web_tools.py` 内部已经写了优雅降级路径：
-
-```python
-aux_client, effective_model, _ = _resolve_web_extract_auxiliary(model)
-if aux_client is None or not effective_model:
-    logger.warning("No auxiliary model available for web content processing")
-    return None    # ← 调用方进入"返回 truncated 原文"分支
-```
-
-效果：超过 5000 字符的网页**不再生成 markdown 摘要**，而是直接 truncate 到原文 5000 字符。模型仍能看到内容，只是不那么紧凑。
-
-未来移植真实 `auxiliary_client.py` 时，**只换文件，不改任何 web_tools 代码**——这就是为什么 shim 严格保留 4 个符号的签名（`async_call_llm` / `extract_content_or_reasoning` / `get_async_text_auxiliary_client` / `get_auxiliary_extra_body`）。
-
-### 13.5 interrupt 的提前引入
-
-按原计划 `tools/interrupt.py` 应在 Wave 5 引入，但 Wave 4 的 `web_tools.py` 在 8 处用了 `from tools.interrupt import is_interrupted`（lazy import）。两个选择：
-
-1. 给 8 处都打 `try/except ImportError` 补丁（破坏 verbatim 原则）
-2. 直接把 98 行 `interrupt.py` 提前 verbatim 复制过来
-
-选了 2。这意味着 Wave 5 的实质内容只剩 `tool_result_storage` + `budget_config`。
-
-`interrupt` 提供按线程隔离的中断信号（`set_interrupt(active, thread_id)` / `is_interrupted()`），背后是 `set[int]` + `threading.Lock`。当前没有调用方 `set_interrupt(True)`——所以 `is_interrupted()` 永远返回 False，不影响功能。预留给后续 Ctrl+C 处理 / gateway 多 session 模式。
-
-### 13.6 file_state 是一个 no-op shim
-
-上游 `tools/file_state.py` 332 行实现 cross-tool 读写时间戳：跨工具 / 跨子 agent 检测"另一个工具刚改过这个文件，你的 read 已过时"，并对并发写串行化。phalanx Wave 1 用 73 行的 shim 替代——所有函数返回安全默认值（无追踪 / 无 staleness 警告 / 无锁）。
-
-shim 严格保留**所有公开符号**：`FileStateRegistry` / `get_registry` / `record_read` / `note_write` / `check_stale` / `lock_path` / `writes_since` / `known_reads`。`file_tools.py` 和 `file_operations.py` 的 import 不需要任何修改，未来直接用上游文件覆盖即可。
-
-代价：单 agent 单线程下 file 工具的并发 / staleness 警告暂时缺失。Phase 7+ 引入子 agent 后必须移植真实版本。
+§2.2 的非平凡决策（tool_result_storage 三层防御 / Windows ARG_MAX 适配 / TodoStore 会话级共享 / auxiliary_client 降级路径 / interrupt 提前引入 / file_state no-op shim）已抽到独立设计文档：见 [`phase-2.2-tools.md`](phase-2.2-tools.md)。
