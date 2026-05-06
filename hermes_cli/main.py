@@ -1288,9 +1288,9 @@ def cmd_eval_run(args: argparse.Namespace) -> int:
         records = run_tasks(factory, tasks)
 
     if getattr(args, "emit_json", False):
-        print(format_report_json(records))
+        print(format_report_json(records, tasks=tasks))
     else:
-        print(format_report_text(records))
+        print(format_report_text(records, tasks=tasks))
 
     # Non-zero exit when any task failed or errored — useful for CI gates
     # later, even though wave 1 verifiers all SKIP.

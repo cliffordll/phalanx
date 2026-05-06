@@ -1,12 +1,14 @@
 """
-Phalanx evaluation harness — Phase 2.8.a wave 1 skeleton.
+Phalanx evaluation harness — Phase 2.8.a waves 1–3.
 
 Loads "golden tasks" from YAML files, runs each one through ``AIAgent.
 run_conversation``, captures a ``RunRecord`` (verdict + tokens + cost +
-turns), and renders a comparable report.  Wave 1 ships the data shapes,
-loader, runner skeleton, and report renderer; the three concrete
-verifier types (``exact_match`` / ``tool_called`` / ``file_state``)
-arrive in wave 3, the seed task set in wave 2.
+turns), and renders a comparable report.  Wave 1 shipped the data
+shapes, loader, runner skeleton, and report renderer; wave 2 added the
+seed task set; wave 3 fills in the three verifier types
+(``exact_match`` / ``tool_called`` / ``file_state``), wires per-task
+cost via ``agent.usage_pricing``, and surfaces structured tool_calls
+on ``RunRecord``.
 
 Design rationale: see [`docs/agent-self-evolution.md`](../docs/agent-self-evolution.md)
 §2.6 and [`docs/MIGRATION_PLAN.md`](../docs/MIGRATION_PLAN.md) §2.8.a.
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -77,6 +80,13 @@ class RunRecord:
     summary (role + tool name only) rather than full message content —
     full trajectory lives in SessionDB and is too noisy for diffing
     runs across model versions.
+
+    ``tool_calls`` is the structured list of (name, arguments) tuples
+    extracted from assistant turns — this is what ``tool_called`` /
+    ``args_subset`` verifiers run against.  ``cost_status`` mirrors
+    ``CostResult.status`` from agent.usage_pricing ("estimated" /
+    "actual" / "included" / "unknown") so reports can flag rows whose
+    pricing isn't reliable.
     """
 
     task_id: str
@@ -86,11 +96,16 @@ class RunRecord:
     api_calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_tokens: int = 0
     cost_usd: float = 0.0
+    cost_status: str = "unknown"
     duration_seconds: float = 0.0
     stop_reason: str = ""
     final_response: str = ""
     trajectory_summary: List[str] = field(default_factory=list)
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
     error: Optional[str] = None
     session_id: Optional[str] = None
 
@@ -102,9 +117,6 @@ class RunRecord:
 
 # ── Verifier registry ────────────────────────────────────────────────
 
-# Wave 1 ships an empty registry so any task whose ``verifier_type``
-# isn't recognised falls back to SKIP (rather than crashing).  Wave 3
-# fills in ``exact_match`` / ``tool_called`` / ``file_state``.
 VerifierFn = Callable[[GoldenTask, RunRecord], "VerifierResult"]
 
 
@@ -122,9 +134,10 @@ VERIFIERS: Dict[str, VerifierFn] = {}
 def register_verifier(name: str) -> Callable[[VerifierFn], VerifierFn]:
     """Decorator to register a verifier under ``name``.
 
-    Wave 3 adds the three concrete types via this decorator.  Keeping
-    registration explicit (vs auto-discovery) mirrors phalanx's
-    static-import pattern in ``tools/__init__.py``.
+    Wave 3 ships ``exact_match`` / ``tool_called`` / ``file_state``
+    via this decorator.  Keeping registration explicit (vs
+    auto-discovery) mirrors phalanx's static-import pattern in
+    ``tools/__init__.py``.
     """
 
     def _wrap(fn: VerifierFn) -> VerifierFn:
@@ -149,6 +162,177 @@ def _run_verifier(task: GoldenTask, record: RunRecord) -> VerifierResult:
     except Exception as exc:  # pragma: no cover — safety net
         logger.exception("verifier %s crashed", task.verifier_type)
         return VerifierResult(Verdict.ERROR, f"verifier crashed: {exc}")
+
+
+# ── Concrete verifiers (wave 3) ──────────────────────────────────────
+
+
+def _as_str_list(value: Any) -> List[str]:
+    """Accept either a single string or a list of strings as ``contains``."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(v) for v in value]
+    raise ValueError(f"expected string or list of strings, got {type(value).__name__}")
+
+
+@register_verifier("exact_match")
+def _verify_exact_match(task: GoldenTask, record: RunRecord) -> VerifierResult:
+    """Assert that ``record.final_response`` contains every ``contains``
+    substring (AND semantics).  ``case_insensitive`` (bool, default
+    false) lowercases both sides before comparing.
+
+    Schema (under ``expected``):
+      * ``contains``: str | list[str]   — required
+      * ``case_insensitive``: bool      — optional, default false
+    """
+    needles = _as_str_list(task.expected.get("contains"))
+    if not needles:
+        return VerifierResult(
+            Verdict.ERROR,
+            "exact_match: expected.contains is required and must be non-empty",
+        )
+    haystack = record.final_response or ""
+    if task.expected.get("case_insensitive"):
+        haystack_cmp = haystack.lower()
+        needles_cmp = [n.lower() for n in needles]
+    else:
+        haystack_cmp = haystack
+        needles_cmp = needles
+    missing = [orig for orig, cmp_ in zip(needles, needles_cmp) if cmp_ not in haystack_cmp]
+    if missing:
+        return VerifierResult(
+            Verdict.FAIL,
+            f"final_response missing substring(s): {missing!r}",
+        )
+    return VerifierResult(
+        Verdict.PASS,
+        f"final_response contains {len(needles)} required substring(s)",
+    )
+
+
+def _args_subset_match(actual: Dict[str, Any], expected: Dict[str, Any]) -> Optional[str]:
+    """Return None on match, or a human-readable mismatch description.
+
+    Subset semantics: every key in ``expected`` must be present in
+    ``actual`` with an equal value.  Missing keys / mismatched values
+    produce a single-line reason — wave 3 keeps this strict-equality
+    only; richer matchers (regex / contains / glob on path) can land in
+    later waves if needed.
+    """
+    for key, want in expected.items():
+        if key not in actual:
+            return f"args missing key {key!r}"
+        if actual[key] != want:
+            return f"args[{key!r}] = {actual[key]!r}, expected {want!r}"
+    return None
+
+
+@register_verifier("tool_called")
+def _verify_tool_called(task: GoldenTask, record: RunRecord) -> VerifierResult:
+    """Assert that the agent invoked a specific tool (optionally with
+    matching args).  Walks ``record.tool_calls`` (populated by the
+    runner from each assistant turn).
+
+    Schema (under ``expected``):
+      * ``tool``: str          — required, tool name to match
+      * ``args_subset``: dict  — optional, every key/value must match
+    """
+    want = task.expected.get("tool")
+    if not want:
+        return VerifierResult(
+            Verdict.ERROR,
+            "tool_called: expected.tool is required",
+        )
+    args_subset = task.expected.get("args_subset") or {}
+    if not isinstance(args_subset, dict):
+        return VerifierResult(
+            Verdict.ERROR,
+            f"tool_called: expected.args_subset must be a mapping, got {type(args_subset).__name__}",
+        )
+
+    matching_name = [c for c in record.tool_calls if c.get("name") == want]
+    if not matching_name:
+        called = sorted({c.get("name", "") for c in record.tool_calls if c.get("name")})
+        return VerifierResult(
+            Verdict.FAIL,
+            f"tool {want!r} never called; called instead: {called or '(none)'}",
+        )
+
+    if not args_subset:
+        return VerifierResult(Verdict.PASS, f"tool {want!r} called {len(matching_name)} time(s)")
+
+    # Find at least one call whose args satisfy the subset.
+    last_mismatch = ""
+    for call in matching_name:
+        actual_args = call.get("arguments") or {}
+        if not isinstance(actual_args, dict):
+            last_mismatch = f"args not a dict (got {type(actual_args).__name__})"
+            continue
+        mismatch = _args_subset_match(actual_args, args_subset)
+        if mismatch is None:
+            return VerifierResult(
+                Verdict.PASS,
+                f"tool {want!r} called with matching args_subset",
+            )
+        last_mismatch = mismatch
+    return VerifierResult(
+        Verdict.FAIL,
+        f"tool {want!r} called {len(matching_name)} time(s) but no call matched args_subset: {last_mismatch}",
+    )
+
+
+@register_verifier("file_state")
+def _verify_file_state(task: GoldenTask, record: RunRecord) -> VerifierResult:
+    """Assert post-run filesystem state at ``expected.path``.
+
+    Path resolution: relative paths resolve against ``os.getcwd()`` (the
+    eval CLI runs at the repo root, so a relative ``eval_artifact.txt``
+    lands beside ``pyproject.toml``).  Wave 4 may add per-task tmp
+    sandboxing so this stops touching the working tree.
+
+    Schema (under ``expected``):
+      * ``path``: str           — required
+      * ``exists``: bool        — optional, default true
+      * ``contains``: str | list[str]  — optional substring(s) to match
+    """
+    rel = task.expected.get("path")
+    if not rel:
+        return VerifierResult(
+            Verdict.ERROR,
+            "file_state: expected.path is required",
+        )
+    target = Path(rel)
+    if not target.is_absolute():
+        target = Path(os.getcwd()) / target
+    must_exist = task.expected.get("exists", True)
+
+    if not target.exists():
+        if not must_exist:
+            return VerifierResult(Verdict.PASS, f"{rel!r} absent as expected")
+        return VerifierResult(Verdict.FAIL, f"{rel!r} not found at {target}")
+
+    if not must_exist:
+        return VerifierResult(Verdict.FAIL, f"{rel!r} unexpectedly exists at {target}")
+
+    needles = _as_str_list(task.expected.get("contains"))
+    if not needles:
+        return VerifierResult(Verdict.PASS, f"{rel!r} exists")
+
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return VerifierResult(Verdict.ERROR, f"file_state: read of {rel!r} failed: {exc}")
+
+    missing = [n for n in needles if n not in text]
+    if missing:
+        return VerifierResult(
+            Verdict.FAIL,
+            f"{rel!r} missing substring(s): {missing!r}",
+        )
+    return VerifierResult(Verdict.PASS, f"{rel!r} contains all required substrings")
 
 
 # ── YAML loader ──────────────────────────────────────────────────────
@@ -253,23 +437,88 @@ def _summarise_messages(messages: Sequence[Any]) -> List[str]:
     return out
 
 
-def _extract_token_totals(messages: Sequence[Any]) -> tuple[int, int]:
-    """Best-effort token total reconstruction from message metadata.
+def _extract_tool_calls(messages: Sequence[Any]) -> List[Dict[str, Any]]:
+    """Walk ``messages`` and return every assistant tool_call as a flat
+    list of ``{name, arguments, id}`` dicts.
 
-    Wave 1 returns (0, 0) when usage isn't attached — actual aggregation
-    moves to wave 3 once the SessionDB query is wired in.  Keeping the
-    signature stable now means the report renderer doesn't change later.
+    ``arguments`` is parsed from JSON when possible (the OpenAI SDK
+    serialises it as a JSON string); on parse failure the raw string is
+    kept under ``arguments_raw`` so verifiers can still surface
+    something useful in their reason.
     """
-    input_tokens = 0
-    output_tokens = 0
+    out: List[Dict[str, Any]] = []
     for msg in messages:
         if not isinstance(msg, dict):
             continue
-        usage = msg.get("usage") or {}
-        if isinstance(usage, dict):
-            input_tokens += int(usage.get("prompt_tokens") or 0)
-            output_tokens += int(usage.get("completion_tokens") or 0)
-    return input_tokens, output_tokens
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+            args_raw = fn.get("arguments") if isinstance(fn, dict) else getattr(fn, "arguments", None)
+            parsed: Any
+            if isinstance(args_raw, dict):
+                parsed = args_raw
+                args_raw_str: Optional[str] = None
+            else:
+                args_raw_str = args_raw if isinstance(args_raw, str) else (
+                    None if args_raw is None else str(args_raw)
+                )
+                if args_raw_str:
+                    try:
+                        parsed = json.loads(args_raw_str)
+                    except (ValueError, TypeError):
+                        parsed = None
+                else:
+                    parsed = {}
+            entry: Dict[str, Any] = {
+                "name": name or "",
+                "arguments": parsed if isinstance(parsed, dict) else None,
+                "id": tc.get("id"),
+            }
+            if args_raw_str is not None and not isinstance(parsed, dict):
+                entry["arguments_raw"] = args_raw_str
+            out.append(entry)
+    return out
+
+
+def _compute_cost_usd(
+    agent: Any, usage_totals: Dict[str, int]
+) -> tuple[float, str]:
+    """Estimate USD cost for the run via ``agent.usage_pricing``.
+
+    Returns ``(cost_usd, status)`` where status is one of
+    "estimated" / "actual" / "included" / "unknown".  Returns
+    ``(0.0, "unknown")`` on any failure — eval should never crash
+    because pricing data is missing for some model.
+    """
+    try:
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+        canon = CanonicalUsage(
+            input_tokens=int(usage_totals.get("input_tokens", 0)),
+            output_tokens=int(usage_totals.get("output_tokens", 0)),
+            cache_read_tokens=int(usage_totals.get("cache_read_tokens", 0)),
+            cache_write_tokens=int(usage_totals.get("cache_write_tokens", 0)),
+            reasoning_tokens=int(usage_totals.get("reasoning_tokens", 0)),
+        )
+        result = estimate_usage_cost(
+            getattr(agent, "model", "") or "",
+            canon,
+            provider=getattr(agent, "provider", None),
+            base_url=getattr(agent, "base_url", None) or None,
+        )
+    except Exception as exc:
+        logger.debug("cost estimation failed: %s", exc)
+        return 0.0, "unknown"
+    amount = result.amount_usd
+    if amount is None:
+        return 0.0, result.status
+    try:
+        return float(amount), result.status
+    except (TypeError, ValueError):
+        return 0.0, result.status
 
 
 def run_task(
@@ -325,7 +574,17 @@ def run_task(
     record.stop_reason = str(result.get("stop_reason") or "")
     record.final_response = str(result.get("final_response") or "")
     record.trajectory_summary = _summarise_messages(messages)
-    record.input_tokens, record.output_tokens = _extract_token_totals(messages)
+    record.tool_calls = _extract_tool_calls(messages)
+
+    usage_totals = result.get("usage_totals") or {}
+    if not isinstance(usage_totals, dict):
+        usage_totals = {}
+    record.input_tokens = int(usage_totals.get("input_tokens") or 0)
+    record.output_tokens = int(usage_totals.get("output_tokens") or 0)
+    record.cache_read_tokens = int(usage_totals.get("cache_read_tokens") or 0)
+    record.cache_write_tokens = int(usage_totals.get("cache_write_tokens") or 0)
+    record.reasoning_tokens = int(usage_totals.get("reasoning_tokens") or 0)
+    record.cost_usd, record.cost_status = _compute_cost_usd(agent, usage_totals)
     record.session_id = getattr(agent, "session_id", None)
     record.duration_seconds = time.time() - started
 
@@ -347,16 +606,27 @@ def run_tasks(
 # ── Report renderers ────────────────────────────────────────────────
 
 
-def format_report_text(records: Sequence[RunRecord]) -> str:
+def format_report_text(
+    records: Sequence[RunRecord],
+    *,
+    tasks: Optional[Sequence[GoldenTask]] = None,
+) -> str:
     """Human-readable summary of a run set.
 
-    First a per-task block, then an aggregate footer.  Designed to fit
-    inside a terminal — long final_response / trajectory entries are
-    truncated.  The ``cost_usd`` figure is left at 0.0 in wave 1; it
-    fills in when wave 3 wires usage_pricing.
+    Per-task block (verdict + turns + tokens + duration), optional
+    reason / error lines, then an aggregate footer with per-category
+    pass-rate breakdown when ``tasks`` is supplied.  Designed to fit
+    inside a terminal — long entries are truncated upstream.
     """
     if not records:
         return "(no tasks ran)"
+
+    # Build task_id → category lookup so the per-category footer can
+    # bucket records without re-loading YAML.
+    category_by_id: Dict[str, str] = {}
+    if tasks is not None:
+        for t in tasks:
+            category_by_id[t.task_id] = t.category
 
     lines: List[str] = []
     pass_count = 0
@@ -365,6 +635,9 @@ def format_report_text(records: Sequence[RunRecord]) -> str:
     skip_count = 0
     total_turns = 0
     total_cost = 0.0
+    has_unknown_cost = False
+    # per-category aggregates: {category: [pass, fail, error, skip]}
+    cat_buckets: Dict[str, List[int]] = {}
     for r in records:
         marker = {
             Verdict.PASS: "✓",
@@ -372,10 +645,11 @@ def format_report_text(records: Sequence[RunRecord]) -> str:
             Verdict.ERROR: "!",
             Verdict.SKIP: "~",
         }[r.verdict]
+        cost_marker = "" if r.cost_status in ("estimated", "actual") else " ?"
         lines.append(
             f"{marker} {r.task_id:30s}  {r.verdict.value:5s}  "
             f"turns={r.turns:<3}  tokens={r.input_tokens}+{r.output_tokens:<5}  "
-            f"{r.duration_seconds:.1f}s"
+            f"${r.cost_usd:.4f}{cost_marker}  {r.duration_seconds:.1f}s"
         )
         if r.reason:
             lines.append(f"    reason: {r.reason}")
@@ -383,6 +657,14 @@ def format_report_text(records: Sequence[RunRecord]) -> str:
             lines.append(f"    error:  {r.error}")
         total_turns += r.turns
         total_cost += r.cost_usd
+        if r.cost_status == "unknown":
+            has_unknown_cost = True
+        idx = {
+            Verdict.PASS: 0, Verdict.FAIL: 1, Verdict.ERROR: 2, Verdict.SKIP: 3,
+        }[r.verdict]
+        cat = category_by_id.get(r.task_id, "uncategorised")
+        bucket = cat_buckets.setdefault(cat, [0, 0, 0, 0])
+        bucket[idx] += 1
         if r.verdict == Verdict.PASS:
             pass_count += 1
         elif r.verdict == Verdict.FAIL:
@@ -400,22 +682,40 @@ def format_report_text(records: Sequence[RunRecord]) -> str:
         f"Total: {n} tasks │ {pass_count} PASS │ {fail_count} FAIL │ "
         f"{error_count} ERROR │ {skip_count} SKIP │ "
         f"{avg_turns:.1f} avg turns │ ${total_cost:.4f}"
+        + (" (some unknown)" if has_unknown_cost else "")
     )
+    if cat_buckets and (tasks is not None):
+        # Stable, alphabetical category order so day-over-day diffs line up.
+        for cat in sorted(cat_buckets):
+            p, f_, e, s = cat_buckets[cat]
+            total = p + f_ + e + s
+            lines.append(
+                f"  · {cat:12s} {p}/{total} pass │ "
+                f"{f_} fail │ {e} err │ {s} skip"
+            )
     return "\n".join(lines)
 
 
-def format_report_json(records: Sequence[RunRecord]) -> str:
+def format_report_json(
+    records: Sequence[RunRecord],
+    *,
+    tasks: Optional[Sequence[GoldenTask]] = None,
+) -> str:
     """Machine-readable shape — same fields the text renderer uses."""
     return json.dumps(
         {
             "records": [r.to_dict() for r in records],
-            "summary": _summary(records),
+            "summary": _summary(records, tasks=tasks),
         },
         indent=2,
     )
 
 
-def _summary(records: Sequence[RunRecord]) -> Dict[str, Any]:
+def _summary(
+    records: Sequence[RunRecord],
+    *,
+    tasks: Optional[Sequence[GoldenTask]] = None,
+) -> Dict[str, Any]:
     n = len(records)
     counts = {v.value: 0 for v in Verdict}
     for r in records:
@@ -424,6 +724,18 @@ def _summary(records: Sequence[RunRecord]) -> Dict[str, Any]:
     total_cost = sum(r.cost_usd for r in records)
     total_in = sum(r.input_tokens for r in records)
     total_out = sum(r.output_tokens for r in records)
+
+    # Per-category PASS/FAIL/ERROR/SKIP buckets when tasks are known.
+    category_breakdown: Dict[str, Dict[str, int]] = {}
+    if tasks is not None:
+        category_by_id = {t.task_id: t.category for t in tasks}
+        for r in records:
+            cat = category_by_id.get(r.task_id, "uncategorised")
+            bucket = category_breakdown.setdefault(
+                cat, {v.value: 0 for v in Verdict}
+            )
+            bucket[r.verdict.value] += 1
+
     return {
         "task_count": n,
         "verdicts": counts,
@@ -433,4 +745,5 @@ def _summary(records: Sequence[RunRecord]) -> Dict[str, Any]:
         "total_output_tokens": total_out,
         "total_cost_usd": total_cost,
         "pass_rate": (counts[Verdict.PASS.value] / n) if n else 0.0,
+        "category_breakdown": category_breakdown,
     }

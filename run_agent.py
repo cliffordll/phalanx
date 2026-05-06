@@ -659,6 +659,19 @@ class AIAgent:
         self._cached_system_prompt: Optional[str] = None
         self.platform = platform
 
+        # Per-conversation usage accumulator (§2.8.a wave 3).  Populated
+        # by ``_accumulate_usage`` after every successful API round-trip
+        # and reset at the start of ``run_conversation``.  Lets the eval
+        # harness compute cost / token totals per task without scraping
+        # the messages list (which has no usage attached).
+        self.usage_totals: Dict[str, int] = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+
     # ── small helpers ────────────────────────────────────────────────
 
     def _safe_print(self, *args, **kwargs) -> None:
@@ -1024,6 +1037,33 @@ class AIAgent:
         h = hashlib.sha1(f"{fn_name}|{arguments}|{index}".encode("utf-8")).hexdigest()
         return f"call_{h[:24]}"
 
+    def _accumulate_usage(self, response: Any) -> None:
+        """Sum this turn's ``response.usage`` into ``self.usage_totals``.
+
+        Uses ``agent.usage_pricing.normalize_usage`` so all three API
+        shapes (Anthropic / Codex Responses / OpenAI Chat Completions)
+        produce comparable numbers.  Never raises — usage is optional
+        and a missing or malformed ``response.usage`` just leaves the
+        totals untouched.
+        """
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        try:
+            from agent.usage_pricing import normalize_usage
+            api_mode = "anthropic_messages" if self.provider == "anthropic" else (
+                "codex_responses" if self.provider == "codex" else None
+            )
+            canon = normalize_usage(usage, provider=self.provider, api_mode=api_mode)
+        except Exception as exc:  # pragma: no cover — defensive
+            logger.debug("usage normalization failed: %s", exc)
+            return
+        self.usage_totals["input_tokens"] += canon.input_tokens
+        self.usage_totals["output_tokens"] += canon.output_tokens
+        self.usage_totals["cache_read_tokens"] += canon.cache_read_tokens
+        self.usage_totals["cache_write_tokens"] += canon.cache_write_tokens
+        self.usage_totals["reasoning_tokens"] += canon.reasoning_tokens
+
     # ── API call dispatch + retry ───────────────────────────────────
 
     def _make_api_call(
@@ -1382,6 +1422,16 @@ class AIAgent:
         stop_reason = "completed"
         final_text = ""
 
+        # Reset per-conversation usage accumulator so a reused agent
+        # doesn't carry token totals across run_conversation calls.
+        self.usage_totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+
         while api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
             if self._interrupt_requested:
                 stop_reason = "interrupted"
@@ -1429,6 +1479,8 @@ class AIAgent:
                 # All retries exhausted (or non-retryable).  stop_reason and
                 # final_text were already populated above.
                 break
+
+            self._accumulate_usage(response)
 
             choice = response.choices[0] if getattr(response, "choices", None) else None
             if choice is None:
@@ -1495,6 +1547,7 @@ class AIAgent:
             "api_calls": api_call_count,
             "stop_reason": stop_reason,
             "iterations_used": self.iteration_budget.used,
+            "usage_totals": dict(self.usage_totals),
         }
 
     # ── convenience entry ───────────────────────────────────────────
