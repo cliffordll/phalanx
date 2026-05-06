@@ -139,6 +139,108 @@ def _sanitize_env_file_if_needed(path: Path) -> None:
         pass  # best-effort — don't block gateway startup
 
 
+def read_env_file(path: Path) -> dict[str, str]:
+    """Parse a ``.env`` file into a dict — does NOT mutate ``os.environ``.
+
+    Used by the web /api/env endpoints to read the on-disk file
+    independently of whatever shell-level overrides happened to be
+    loaded into the process.  Empty / missing → ``{}``.
+    """
+    if not path.exists():
+        return {}
+    try:
+        from dotenv import dotenv_values  # type: ignore[import-not-found]
+
+        parsed = dotenv_values(str(path))
+    except ImportError:
+        # Should never trigger — python-dotenv is in core deps —
+        # but a manual KEY=VAL parser keeps us alive in degraded envs.
+        parsed = {}
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                parsed[k.strip()] = v.strip().strip('"').strip("'")
+        except OSError:
+            return {}
+    return {k: (v or "") for k, v in parsed.items() if k}
+
+
+def save_env_value(path: Path, key: str, value: str) -> None:
+    """Set ``key=value`` in ``path``, replacing the existing line in place
+    or appending a new one.  Comments / formatting of unrelated lines
+    are preserved.
+
+    Creates the file (and parent dirs) if missing; uses an in-place
+    rewrite (not atomic_replace) because .env files are tiny and
+    callers expect the write to be visible immediately.
+    """
+    if not key or not key.replace("_", "").isalnum():
+        raise ValueError(f"Invalid env var name: {key!r}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = []
+    if path.exists():
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+
+    new_line = f"{key}={value}"
+    replaced = False
+    out: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if (
+            not replaced
+            and stripped
+            and not stripped.startswith("#")
+            and "=" in stripped
+            and stripped.split("=", 1)[0].strip() == key
+        ):
+            out.append(new_line)
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(new_line)
+
+    path.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def remove_env_value(path: Path, key: str) -> bool:
+    """Delete ``key`` from ``path``.  Returns True if a line was removed,
+    False if the key wasn't present (or the file is missing)."""
+    if not path.exists():
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+
+    out: list[str] = []
+    removed = False
+    for line in lines:
+        stripped = line.strip()
+        if (
+            not removed
+            and stripped
+            and not stripped.startswith("#")
+            and "=" in stripped
+            and stripped.split("=", 1)[0].strip() == key
+        ):
+            removed = True
+            continue
+        out.append(line)
+    if removed:
+        path.write_text(
+            ("\n".join(out) + "\n") if out else "", encoding="utf-8"
+        )
+    return removed
+
+
 def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,

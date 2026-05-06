@@ -518,6 +518,229 @@ async def get_usage_analytics(days: int = 30):
         db.close()
 
 
+# ── Config endpoints (wave 3) ──────────────────────────────────────────
+
+
+class _ConfigUpdate(BaseModel):
+    config: dict
+
+
+class _ConfigRawUpdate(BaseModel):
+    yaml_text: str
+
+
+@app.get("/api/config")
+async def get_config():
+    """Return the current ``~/.phalanx/config.yaml`` parsed as a dict.
+
+    Falls back to ``{}`` when the file doesn't exist (fresh install).
+    Internal underscore-prefixed keys are filtered out so the SPA
+    doesn't echo state-meta back through PUT.
+    """
+    cfg = load_config()
+    return {k: v for k, v in cfg.items() if not k.startswith("_")}
+
+
+@app.put("/api/config")
+async def update_config(body: _ConfigUpdate):
+    """Replace ``~/.phalanx/config.yaml`` with the supplied dict.
+
+    No deep-merge — the SPA round-trips the full config from GET, edits
+    a few fields, and PUTs the whole thing back.  This matches upstream
+    semantics and avoids the "config file shrinks because the SPA only
+    sent half the keys" trap.
+    """
+    from hermes_cli.config import save_config
+
+    save_config(body.config)
+    return {"ok": True}
+
+
+@app.get("/api/config/raw")
+async def get_config_raw():
+    """Return the YAML text exactly as on disk.
+
+    Lets the ConfigPage's "Raw YAML" tab display formatting / comments
+    that ``load_config`` would silently strip when round-tripped through
+    the parser.
+    """
+    from hermes_constants import get_config_path
+
+    path = get_config_path()
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    return {"yaml": text}
+
+
+@app.put("/api/config/raw")
+async def update_config_raw(body: _ConfigRawUpdate):
+    """Atomically write raw YAML text to ``~/.phalanx/config.yaml``.
+
+    Validates parseability before writing — bad YAML returns 400 instead
+    of corrupting the file.
+    """
+    import yaml
+
+    from hermes_cli.config import ensure_hermes_home
+    from hermes_constants import get_config_path
+
+    try:
+        parsed = yaml.safe_load(body.yaml_text)
+    except yaml.YAMLError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid YAML: {exc}"
+        ) from exc
+    if parsed is not None and not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Top-level YAML must be a dict, got {type(parsed).__name__}",
+        )
+
+    ensure_hermes_home()
+    path = get_config_path()
+    path.write_text(body.yaml_text, encoding="utf-8")
+
+    # Bust the load_config cache so the next GET reflects the write.
+    from hermes_cli.config import _RAW_CONFIG_CACHE
+
+    _RAW_CONFIG_CACHE.pop(str(path), None)
+    return {"ok": True}
+
+
+@app.get("/api/config/defaults")
+async def get_config_defaults():
+    """Canonical defaults — used by the "Reset" button on each field."""
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    return DEFAULT_CONFIG
+
+
+@app.get("/api/config/schema")
+async def get_config_schema():
+    """Auto-inferred schema for the ConfigPage form renderer.
+
+    Type / select-option overrides are baked in for fields where the
+    default value alone doesn't carry the intent (e.g. ``model.provider``
+    is a string default but renders as a select).
+    """
+    from hermes_cli.config import build_config_schema
+
+    fields = build_config_schema()
+    # Stable category order — providers / agent first, phalanx-specific last.
+    seen: list[str] = []
+    for entry in fields.values():
+        cat = entry.get("category", "")
+        if cat and cat not in seen:
+            seen.append(cat)
+    return {"fields": fields, "category_order": seen}
+
+
+# ── Env endpoints (wave 3) ─────────────────────────────────────────────
+
+
+class _EnvVarWrite(BaseModel):
+    key: str
+    value: str = ""
+
+
+class _EnvVarDelete(BaseModel):
+    key: str
+
+
+class _EnvVarReveal(BaseModel):
+    key: str
+
+
+# Reveal rate limit — the dashboard shouldn't be a brute-force oracle.
+_REVEAL_TIMESTAMPS: list[float] = []
+_REVEAL_MAX_PER_WINDOW = 5
+_REVEAL_WINDOW_SECONDS = 30
+
+
+def _env_path() -> "Path":
+    """Resolve ``~/.phalanx/.env`` lazily so monkeypatched ``PHALANX_HOME``
+    in tests redirects everything in this module without re-imports."""
+    return get_env_path()
+
+
+@app.get("/api/env")
+async def get_env_vars():
+    """Enumerate the optional env vars phalanx knows about.
+
+    Returns ``{is_set, redacted_value, description, ...}`` per key; the
+    actual value is never returned here — :func:`reveal_env_var` is the
+    only path that surfaces secrets, and only with a token + rate limit.
+    """
+    from hermes_cli.config import OPTIONAL_ENV_VARS, redact_key
+    from hermes_cli.env_loader import read_env_file
+
+    on_disk = read_env_file(_env_path())
+    out: dict[str, dict] = {}
+    for var, info in OPTIONAL_ENV_VARS.items():
+        value = on_disk.get(var) or os.environ.get(var, "")
+        out[var] = {
+            "is_set": bool(value),
+            "redacted_value": redact_key(value) if value else None,
+            "description": info.get("description", ""),
+            "url": info.get("url"),
+            "category": info.get("category", ""),
+            "is_password": info.get("is_password", False),
+            "advanced": info.get("advanced", False),
+        }
+    return out
+
+
+@app.put("/api/env")
+async def set_env_var(body: _EnvVarWrite):
+    from hermes_cli.env_loader import save_env_value
+
+    try:
+        save_env_value(_env_path(), body.key, body.value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "key": body.key}
+
+
+@app.delete("/api/env")
+async def remove_env_var(body: _EnvVarDelete):
+    from hermes_cli.env_loader import remove_env_value
+
+    if not remove_env_value(_env_path(), body.key):
+        raise HTTPException(
+            status_code=404, detail=f"{body.key} not found in .env"
+        )
+    return {"ok": True, "key": body.key}
+
+
+@app.post("/api/env/reveal")
+async def reveal_env_var(body: _EnvVarReveal):
+    """Return the unredacted value of a single env var.
+
+    Already gated by the auth middleware on /api/.  Adds a sliding-window
+    rate limit so a compromised XSS context can't drain every secret in
+    one burst.  Audit-logs the key name.
+    """
+    from hermes_cli.env_loader import read_env_file
+
+    now = time.time()
+    cutoff = now - _REVEAL_WINDOW_SECONDS
+    _REVEAL_TIMESTAMPS[:] = [t for t in _REVEAL_TIMESTAMPS if t > cutoff]
+    if len(_REVEAL_TIMESTAMPS) >= _REVEAL_MAX_PER_WINDOW:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many reveal requests. Try again shortly.",
+        )
+    _REVEAL_TIMESTAMPS.append(now)
+
+    on_disk = read_env_file(_env_path())
+    value = on_disk.get(body.key)
+    if value is None:
+        raise HTTPException(
+            status_code=404, detail=f"{body.key} not found in .env"
+        )
+    _log.info("env/reveal: %s", body.key)
+    return {"key": body.key, "value": value}
+
+
 # ── SPA mount ──────────────────────────────────────────────────────────
 
 

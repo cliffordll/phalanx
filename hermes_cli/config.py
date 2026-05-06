@@ -204,3 +204,183 @@ def env_var_redacted(name: str) -> str:
     secret values.
     """
     return "<set>" if os.environ.get(name, "").strip() else "<unset>"
+
+
+def redact_key(value: Optional[str]) -> str:
+    """Render a secret as ``abcd…wxyz`` for safe display in the dashboard.
+
+    Empty / very short values fall through to ``...`` so we never leak
+    enough characters to lookup a real key.  Phalanx uses this in
+    ``/api/env`` GET so the SPA can show "is set" without revealing the
+    actual value (the explicit reveal endpoint takes care of that with
+    a token + rate limit).
+    """
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "..."
+    return f"{value[:4]}…{value[-4:]}"
+
+
+# ── Default config tree (used by /api/config/schema and seed) ─────────
+
+# Keep this small and aligned with what phalanx's loop / CLI actually
+# reads.  The web ConfigPage reflects exactly these fields; adding a
+# new branch here automatically surfaces it as a form field.
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "model": {
+        "default": "",
+        "base_url": "",
+        "provider": "",
+    },
+    "agent": {
+        "max_iterations": 90,
+        "max_tokens": 4096,
+        "reasoning_effort": "medium",
+    },
+}
+
+
+# Type / select-option overrides for fields where the default value
+# alone doesn't tell the schema what it should be (e.g. an enum).  Keys
+# are dotted paths (``model.provider``).
+_SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "model.provider": {
+        "type": "select",
+        "options": ["", "openai", "anthropic", "codex"],
+        "description": "LLM provider routing (empty = auto-infer from base_url)",
+    },
+    "agent.reasoning_effort": {
+        "type": "select",
+        "options": ["low", "medium", "high"],
+        "description": "Reasoning depth for o-series / claude thinking models",
+    },
+    "model.default": {
+        "type": "string",
+        "description": "Default model id (e.g. gpt-4o-mini, claude-sonnet-4.5)",
+    },
+    "model.base_url": {
+        "type": "string",
+        "description": "OpenAI-compatible endpoint URL",
+    },
+    "agent.max_iterations": {
+        "type": "number",
+        "description": "Hard cap on tool-call rounds per turn (90 default)",
+    },
+    "agent.max_tokens": {
+        "type": "number",
+        "description": "max_tokens hint passed to the model",
+    },
+}
+
+
+def _infer_type(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "string"
+
+
+def build_config_schema(
+    defaults: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Walk ``defaults`` (DEFAULT_CONFIG) and return a flat dotted-path schema.
+
+    Each entry is ``{type, default, description?, options?, category}``.
+    Type comes from :func:`_infer_type`; ``_SCHEMA_OVERRIDES`` wins where
+    present.  The web ConfigPage uses this to render appropriate inputs
+    (text / number / select).
+    """
+    src = defaults if defaults is not None else DEFAULT_CONFIG
+    schema: Dict[str, Dict[str, Any]] = {}
+
+    def _walk(node: Dict[str, Any], prefix: str) -> None:
+        for k, v in node.items():
+            dotted = f"{prefix}{k}"
+            if isinstance(v, dict):
+                _walk(v, prefix=f"{dotted}.")
+                continue
+            entry: Dict[str, Any] = {
+                "type": _infer_type(v),
+                "default": v,
+                "category": prefix.rstrip(".") or k,
+            }
+            entry.update(_SCHEMA_OVERRIDES.get(dotted, {}))
+            schema[dotted] = entry
+
+    _walk(src, prefix="")
+    return schema
+
+
+# ── Optional env vars (used by /api/env to enumerate known keys) ──────
+
+# Categories: ``providers`` (LLM API keys), ``tools`` (web search etc),
+# ``phalanx`` (path / timezone / skills).  ``advanced=True`` keeps a key
+# out of the default EnvPage view.
+OPTIONAL_ENV_VARS: Dict[str, Dict[str, Any]] = {
+    "OPENAI_API_KEY": {
+        "description": "OpenAI / OpenAI-compatible API key",
+        "category": "providers",
+        "is_password": True,
+        "url": "https://platform.openai.com/api-keys",
+    },
+    "OPENAI_BASE_URL": {
+        "description": "OpenAI-compatible endpoint base URL",
+        "category": "providers",
+        "is_password": False,
+    },
+    "ANTHROPIC_API_KEY": {
+        "description": "Anthropic API key",
+        "category": "providers",
+        "is_password": True,
+        "url": "https://console.anthropic.com/settings/keys",
+    },
+    "OPENROUTER_API_KEY": {
+        "description": "OpenRouter key — for auxiliary_client web summarisation when ported",
+        "category": "providers",
+        "is_password": True,
+        "url": "https://openrouter.ai/keys",
+    },
+    "FIRECRAWL_API_KEY": {
+        "description": "Firecrawl key — web_extract backend",
+        "category": "tools",
+        "is_password": True,
+        "url": "https://www.firecrawl.dev/app/api-keys",
+    },
+    "TAVILY_API_KEY": {
+        "description": "Tavily search API key",
+        "category": "tools",
+        "is_password": True,
+        "url": "https://app.tavily.com/home",
+    },
+    "EXA_API_KEY": {
+        "description": "Exa search API key",
+        "category": "tools",
+        "is_password": True,
+        "url": "https://dashboard.exa.ai/api-keys",
+    },
+    "PARALLEL_API_KEY": {
+        "description": "Parallel.ai search API key",
+        "category": "tools",
+        "is_password": True,
+    },
+    "PHALANX_HOME": {
+        "description": "Override default ~/.phalanx data directory",
+        "category": "phalanx",
+        "is_password": False,
+        "advanced": True,
+    },
+    "PHALANX_TIMEZONE": {
+        "description": "Override timezone for log timestamps (default = local)",
+        "category": "phalanx",
+        "is_password": False,
+        "advanced": True,
+    },
+    "PHALANX_OPTIONAL_SKILLS": {
+        "description": "Override the optional-skills directory path",
+        "category": "phalanx",
+        "is_password": False,
+        "advanced": True,
+    },
+}
