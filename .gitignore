@@ -31,6 +31,7 @@ hermes_agent.egg-info/
 hermes_cli/web_dist/
 web/node_modules/
 web/dist/
+web/*.tsbuildinfo
 
 # Runtime data
 logs/

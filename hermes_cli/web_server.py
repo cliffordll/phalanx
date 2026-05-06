@@ -758,6 +758,11 @@ def mount_spa(application: "FastAPI") -> None:
 
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
+            # /api/* paths that fall through here are real 404s
+            # (the explicit endpoints above didn't match) — surface
+            # the backend message instead of the dev hint.
+            if full_path.startswith("api/"):
+                raise HTTPException(status_code=404, detail="Not Found")
             return JSONResponse(
                 {"error": "Frontend not built. Run: cd web && npm run build"},
                 status_code=404,
@@ -787,6 +792,13 @@ def mount_spa(application: "FastAPI") -> None:
 
     @application.get("/{full_path:path}")
     async def serve_spa(full_path: str):
+        # Never serve the SPA on /api/* — those paths are owned by the
+        # explicit endpoints above, and any /api/foo that wasn't matched
+        # is a 404 (not a SPA client-side route).  Without this guard the
+        # catch-all would return index.html for unknown /api paths,
+        # masking backend bugs as front-end render attempts.
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
         file_path = WEB_DIST / full_path
         # Prevent path traversal (%2e%2e/) — resolved path must stay inside WEB_DIST.
         if (
