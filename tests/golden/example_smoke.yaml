@@ -1,0 +1,19 @@
+# Phase 2.8.a wave 1 — placeholder smoke task to lock the YAML schema.
+#
+# verifier_type uses a name no wave-1 verifier registers, so the runner
+# returns SKIP and the harness exits cleanly without a real model call.
+# Wave 2 replaces this with 10 real seed tasks across categories.
+
+task_id: example_smoke
+category: smoke
+description: |
+  Schema-locking placeholder — the runner can load it, but the verifier
+  isn't implemented yet so the verdict is SKIP.  Replace with real tasks
+  in Phase 2.8.a wave 2.
+
+prompt: "Print 'hello phalanx' and stop."
+
+verifier_type: pending_wave3
+
+expected:
+  contains: ["hello", "phalanx"]

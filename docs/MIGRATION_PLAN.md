@@ -424,6 +424,95 @@ xdg-open http://127.0.0.1:9119/                                # 浏览器看 SP
 
 每一项作为独立 feature 分支完成。每项都要随 CLI 子命令一起出（如 `phalanx skills list`、`phalanx kanban add`、`phalanx mcp connect` 等），保持"每期可调试"的节奏。每项落地后回到 §2.7 web dashboard 把对应 page 加进 NavBar。
 
+> 战略地图见 [`agent-self-evolution.md`](agent-self-evolution.md)：本节列的 17 项不是"等概率任意挑"，而是有依赖关系的——评估闭环 → memory → delegate → skills → guardrails → RL 这条主线决定了"agent 能不能从经验里学到东西"。
+
+#### 2.8.0 当前推荐路径（未来 1–2 周）
+
+依赖关系最清晰、ROI 最高的两条：
+
+1. **§2.8.a Evaluation loop**（约 5 工作日）—— `phalanx eval` 子命令、10 个 golden task、报告渲染、CI 集成。无前置依赖。
+2. **§2.8.b Memory & context**（约 5 工作日）—— `agent/memory_manager.py` 真实版本、`agent/context_compressor.py`、`@reference` resolver、`AIAgent.run_conversation` 集成。前置：§2.8.a 提供 baseline，否则改动无法衡量。
+
+完成这两条后 phalanx 第一次具备"跨 session 学习能力 + 改动可衡量"。剩余 §2.8.c+ 的子系统按 [`agent-self-evolution.md`](agent-self-evolution.md) §4 排序处理。
+
+---
+
+#### 2.8.a Phase 8a — Evaluation loop（5 天）
+
+把 phalanx 装上"任何改动都有数字"的能力。无前置依赖；先做这条让后续每个 §2.8.x 都能"改完先 eval 看 regression"。
+
+| Wave | 内容 | 估行 |
+|---|---|---|
+| 1 | `tests/golden/` 目录 + YAML schema 定义（`task_id` / `prompt` / `expected_outcome` / `verifier_type`）；`hermes_cli/eval.py` skeleton + `phalanx eval` argparse 子命令 | ~250 |
+| 2 | 10 个种子 golden task：3 file ops（read / patch / search）+ 2 web（fetch / extract）+ 2 plan（解释代码 / 提建议）+ 2 multi-tool（"找 X 然后改 Y"）+ 1 oneshot smoke | ~150 |
+| 3 | Verifier 三种：`exact_match`（assistant 最后回复包含 substring）、`tool_called`（trajectory 里出现指定工具调用）、`file_state`（task 跑完后某路径满足条件）；report 渲染（成功率 / token / 平均轮数 / per-task 详情） | ~300 |
+| 4 | CI 集成：pytest fixture 跑 1-2 个 stub-model golden task 防 regression（真 model eval 在 docs 里写"手动周跑"，不进 CI 节省成本）；reports 落 `~/.phalanx/eval/<timestamp>/` | ~150 |
+
+**CLI 暴露**：
+
+```bash
+hermes eval                              # 跑全部 golden task，文本报告到 stdout
+hermes eval --task <id>                  # 只跑一个
+hermes eval --json                       # 机器可读输出
+hermes eval --baseline <run-id> --diff   # 跟历史 run 比 regression
+hermes eval list                         # 列已有 golden task
+```
+
+**验收**：
+
+```bash
+pytest tests/                            # 含 1-2 个 stub-model eval smoke
+hermes eval                              # 真 model 跑 10 task，0 failed
+hermes eval --diff <previous>            # 跟昨天的 run 比"哪 task 多花了 token"
+```
+
+**为什么放第一**：没有 baseline，§2.8.b 的"memory 让 agent 更聪明了吗"无法证明，所有后续优化变成感觉良好的猜测。
+
+---
+
+#### 2.8.b Phase 8b — Memory & context（5 天）
+
+让 agent 跨 session 累积经验、context 接近上限自动压缩、`@reference` 显式引用文件 / 差异。前置：§2.8.a 跑过 baseline。
+
+| Wave | 内容 | 估行 |
+|---|---|---|
+| 1 | `agent/memory_manager.py` 从 shim 升到真实版本：长期记忆 schema（`hermes_state.py` 加 `memories` 表 + FTS5 索引）、`store_memory(category, content, scope)` / `retrieve_memories(query, limit)`、新 session 起头时自动 prepend 相关 memory chunk 到 system_prompt | ~600 |
+| 2 | `agent/context_compressor.py`：当 token 计数 > 阈值（context_length × 0.7）时，自动让 auxiliary_client 把"最早 N 个 turn"压缩成 summary，替换原 messages；保留最近 K 个 turn 完整；走流式不阻塞用户 | ~400 |
+| 3 | `agent/context_references.py`：`@file:path/to/x.py` `@diff` `@url:...` `@session:<id>` 解析；触发时把内容 inline 到 user message。Slash command `/ref` REPL 版 + `lib/api.ts` 加 `resolveReference` 端点（web 用） | ~500 |
+| 4 | 集成：`AIAgent.run_conversation` 三个 hook 点（turn 起头拉 memory / turn 中检测压缩 / 用户 input 解析 reference），加 5 个新 golden task 验"agent 在长 context / 跨 session / `@file:` 三种场景下行为正确" | ~250 |
+
+**CLI / REPL 暴露**：
+
+```bash
+hermes memory list                       # 列所有 memory（按 category）
+hermes memory show <id>
+hermes memory delete <id>
+hermes memory search "<query>"           # FTS5
+# REPL 内
+> @file:src/foo.py 帮我改这个文件        # 自动 inline 文件内容
+> /ref show                              # 看本 turn 解析了哪些 reference
+> /memory show                            # 看本 session 起头拉了哪些 memory
+```
+
+**验收**：
+
+```bash
+pytest tests/                            # 含 memory CRUD + compressor 阈值 + reference 解析单测
+hermes eval                              # 跑 §2.8.a + 5 个新 task，对比 baseline 应不退化
+# 跨 session 验证：
+hermes oneshot "记住我喜欢用 pytest 而不是 unittest"
+# 重开 shell
+hermes oneshot "帮我写一个测试"          # 应自动用 pytest 风格
+```
+
+**为什么放第二**：所有后续"反思 / critic / skill discovery"都需要 agent 知道"过去发生了什么"——memory 是这一切的载体。压缩是"agent 能跑长任务"的必要条件。
+
+---
+
+#### 2.8.c+ 剩余子系统清单
+
+§2.8.a + §2.8.b 完成后，下一批按 [`agent-self-evolution.md`](agent-self-evolution.md) §4 顺序：delegate / skills / guardrails / RL / 动态工具创建。下面是原始 17 项清单（每条形态跟之前一致）：
+
 - **memory & context** — 跨 session 长期记忆 + 接近上下文上限时自动摘要压缩 + `@reference` 文件/差异引用解析：`agent/memory_manager.py`、`agent/context_compressor.py`、`agent/context_engine.py`、`agent/context_references.py`
 - **guardrails** — 工具调用前置审查（危险命令二次确认、SSRF / 敏感数据扫描、skill 调用合规校验）：`agent/tool_guardrails.py`、`tools/skills_guard.py`、`tools/tirith_security.py`、`tools/website_policy.py`
 - **credentials** — 多源凭据池（OAuth / managed gateway / env / config.yaml 优先级合并），让 API key / Google OAuth token 不再只能从 env 取：`agent/credential_pool.py`、`agent/credential_sources.py`、`agent/google_oauth.py`、`hermes_cli/auth*.py`

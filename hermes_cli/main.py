@@ -260,6 +260,35 @@ def _build_parser() -> argparse.ArgumentParser:
     p_doc = sub.add_parser("doctor", help="environment / config sanity check")
     p_doc.set_defaults(func=cmd_doctor)
 
+    # eval -------------------------------------------------------------
+    p_eval = sub.add_parser(
+        "eval",
+        help="run / list / inspect golden-task evaluation harness (§2.8.a)",
+    )
+    p_eval_sub = p_eval.add_subparsers(dest="eval_cmd", metavar="<eval-cmd>")
+    p_eval_run = p_eval_sub.add_parser(
+        "run", help="run all golden tasks (default if no subcommand given)"
+    )
+    p_eval_run.add_argument("--task", default=None,
+                            help="run only this task_id")
+    p_eval_run.add_argument("--json", action="store_true",
+                            dest="emit_json",
+                            help="emit machine-readable report instead of text")
+    p_eval_run.add_argument("--dir", default=None,
+                            help="alternate golden-task dir (default: tests/golden)")
+    p_eval_run.set_defaults(func=cmd_eval_run)
+    p_eval_list = p_eval_sub.add_parser(
+        "list", help="list registered golden tasks"
+    )
+    p_eval_list.add_argument("--dir", default=None)
+    p_eval_list.set_defaults(func=cmd_eval_list)
+    # Bare `hermes eval` runs all (most common usage).
+    p_eval.add_argument("--task", default=None,
+                        help="run only this task_id (alias for `eval run --task`)")
+    p_eval.add_argument("--json", action="store_true", dest="emit_json")
+    p_eval.add_argument("--dir", default=None)
+    p_eval.set_defaults(func=cmd_eval_default)
+
     # web --------------------------------------------------------------
     p_web = sub.add_parser(
         "web", help="start the browser dashboard (Phase 2.7 wave 1)"
@@ -1181,6 +1210,119 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         return 1
     print("all checks passed")
     return 0
+
+
+# ── eval subcommand (Phase 2.8.a wave 1) ───────────────────────────────
+
+
+def _build_eval_agent_factory():
+    """Return a factory(task) → AIAgent stitched from current CLI flags / config.
+
+    Each task gets its own AIAgent instance so token counts / session ids
+    don't bleed across runs.  Factory is lazy because eval.py imports
+    pyyaml + dataclasses only — building an agent requires the heavier
+    run_agent + provider stack.
+    """
+    from run_agent import AIAgent
+
+    cfg = load_config()
+    base_url = (
+        _Flags.base_url
+        or os.environ.get("OPENAI_BASE_URL")
+        or cfg_get(cfg, "model", "base_url", default="")
+    )
+    api_key = _Flags.api_key or os.environ.get("OPENAI_API_KEY", "")
+    default_model = (
+        _Flags.model
+        or os.environ.get("PHALANX_MODEL")
+        or os.environ.get("OPENAI_MODEL")
+        or cfg_get(cfg, "model", "default", default="")
+    )
+
+    def _factory(task):
+        from hermes_cli.eval import GoldenTask  # type: ignore
+        assert isinstance(task, GoldenTask)
+        return AIAgent(
+            base_url=base_url,
+            api_key=api_key,
+            model=task.model or default_model,
+            max_iterations=task.max_iterations,
+            verbose_logging=_Flags.debug,
+            quiet_mode=_Flags.quiet,
+        )
+
+    return _factory
+
+
+def cmd_eval_run(args: argparse.Namespace) -> int:
+    """Run all golden tasks (or one via --task) and print the report."""
+    from hermes_cli.eval import (
+        format_report_json,
+        format_report_text,
+        load_golden_tasks,
+        load_task,
+        run_task,
+        run_tasks,
+    )
+
+    factory = _build_eval_agent_factory()
+
+    try:
+        if args.task:
+            tasks = [load_task(args.task, args.dir)]
+        else:
+            tasks = load_golden_tasks(args.dir)
+    except (KeyError, ValueError) as exc:
+        print(f"eval: {exc}", file=sys.stderr)
+        return 1
+
+    if not tasks:
+        print("eval: no golden tasks found "
+              f"(expected *.yaml under {args.dir or 'tests/golden/'})",
+              file=sys.stderr)
+        return 1
+
+    if len(tasks) == 1:
+        records = [run_task(factory, tasks[0])]
+    else:
+        records = run_tasks(factory, tasks)
+
+    if getattr(args, "emit_json", False):
+        print(format_report_json(records))
+    else:
+        print(format_report_text(records))
+
+    # Non-zero exit when any task failed or errored — useful for CI gates
+    # later, even though wave 1 verifiers all SKIP.
+    bad = sum(1 for r in records if r.verdict.value in ("FAIL", "ERROR"))
+    return 1 if bad else 0
+
+
+def cmd_eval_list(args: argparse.Namespace) -> int:
+    """List registered golden tasks (no execution)."""
+    from hermes_cli.eval import load_golden_tasks
+
+    try:
+        tasks = load_golden_tasks(args.dir)
+    except ValueError as exc:
+        print(f"eval list: {exc}", file=sys.stderr)
+        return 1
+    if not tasks:
+        print("(no golden tasks registered)")
+        return 0
+    print(f"{'task_id':30s}  {'verifier':16s}  {'category':16s}  prompt")
+    print("─" * 90)
+    for t in tasks:
+        prompt_preview = t.prompt.replace("\n", " ")[:36]
+        print(f"{t.task_id:30s}  {t.verifier_type:16s}  "
+              f"{t.category:16s}  {prompt_preview}")
+    print(f"\n{len(tasks)} tasks")
+    return 0
+
+
+def cmd_eval_default(args: argparse.Namespace) -> int:
+    """Bare ``hermes eval`` defaults to ``eval run`` for ergonomics."""
+    return cmd_eval_run(args)
 
 
 # ── web subcommand (Phase 2.7 wave 1) ──────────────────────────────────
