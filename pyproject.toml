@@ -31,6 +31,11 @@ dependencies = [
   # input, slash-command completion, and patch_stdout streaming.
   # cli.py imports it lazily and falls back to input() if missing.
   "prompt_toolkit>=3.0.50,<4",
+  # Phase 2.7 wave 1 — web dashboard backend.  FastAPI app +
+  # uvicorn server.  hermes_cli/web_server.py imports lazily and
+  # raises a SystemExit with an install hint if missing.
+  "fastapi>=0.115,<1",
+  "uvicorn[standard]>=0.32,<1",
 ]
 
 [project.optional-dependencies]

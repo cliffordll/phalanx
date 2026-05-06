@@ -260,6 +260,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p_doc = sub.add_parser("doctor", help="environment / config sanity check")
     p_doc.set_defaults(func=cmd_doctor)
 
+    # web --------------------------------------------------------------
+    p_web = sub.add_parser(
+        "web", help="start the browser dashboard (Phase 2.7 wave 1)"
+    )
+    p_web.add_argument("--port", type=int, default=9119,
+                       help="port to bind (default: 9119)")
+    p_web.add_argument("--bind", default="127.0.0.1",
+                       help="interface to bind (default: 127.0.0.1)")
+    p_web.add_argument("--no-open", action="store_true",
+                       help="don't auto-open the browser (CI / SSH)")
+    p_web.add_argument("--token", default=None,
+                       help="fixed session token (default: random; CI / tests)")
+    p_web.add_argument("--insecure", action="store_true",
+                       help="allow non-loopback bind (NOT recommended)")
+    p_web.set_defaults(func=cmd_web)
+
     return parser
 
 
@@ -1164,6 +1180,33 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print(f"  - {i}")
         return 1
     print("all checks passed")
+    return 0
+
+
+# ── web subcommand (Phase 2.7 wave 1) ──────────────────────────────────
+
+
+def cmd_web(args: argparse.Namespace) -> int:
+    """Start the browser dashboard.
+
+    fastapi / uvicorn are imported lazily inside ``hermes_cli.web_server``
+    so callers of other subcommands don't pay the ~150 ms import cost.
+    """
+    try:
+        from hermes_cli.web_server import start_server
+    except SystemExit as exc:
+        # web_server raises SystemExit on missing fastapi/uvicorn — surface
+        # the install hint instead of a stack trace.
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    start_server(
+        host=args.bind,
+        port=args.port,
+        open_browser=not args.no_open,
+        token=args.token,
+        allow_public=args.insecure,
+    )
     return 0
 
 
