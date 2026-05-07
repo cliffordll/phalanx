@@ -23,6 +23,7 @@ install can read the same database — see the design doc §1.1 for why.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -41,7 +42,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -115,6 +116,17 @@ CREATE TABLE IF NOT EXISTS memories (
     last_used_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS event_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_type TEXT NOT NULL,
+    session_id TEXT,
+    agent_id TEXT,
+    target TEXT,
+    content_hash TEXT,
+    metadata TEXT,
+    timestamp REAL NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
@@ -122,6 +134,10 @@ CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestam
 CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
 CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned DESC, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_event_log_session ON event_log(session_id);
+CREATE INDEX IF NOT EXISTS idx_event_log_type ON event_log(event_type);
+CREATE INDEX IF NOT EXISTS idx_event_log_timestamp ON event_log(timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_event_log_target ON event_log(target);
 """
 
 FTS_SQL = """
@@ -541,6 +557,13 @@ class SessionDB:
                     cursor.execute("SELECT 1 FROM memories_fts LIMIT 0")
                 except sqlite3.OperationalError:
                     cursor.executescript(MEMORIES_FTS_SQL)
+            if current_version < 13:
+                # v13: event_log audit table.  Structural-only — the
+                # CREATE TABLE in SCHEMA_SQL handles fresh databases and
+                # _reconcile_columns picks up future column adds.  No
+                # backfill: existing DBs simply start with an empty
+                # event_log.
+                pass
             if current_version < SCHEMA_VERSION:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -1439,7 +1462,42 @@ class SessionDB:
                 (cat, scope, content, source_session_id,
                  1 if pinned else 0, now, now),
             )
-            return cursor.lastrowid
+            new_id = int(cursor.lastrowid or 0)
+            # §2.8.d wave 3 — audit row inside the same transaction so
+            # the memory and its log entry commit atomically.  Hash the
+            # content (not the row id) so identical memories produce
+            # identical hashes — useful for "did the agent already store
+            # this" forensics.
+            try:
+                content_hash = hashlib.sha256(
+                    content.encode("utf-8", errors="replace")
+                ).hexdigest()
+                metadata_blob = json.dumps(
+                    {
+                        "memory_id": new_id,
+                        "scope": scope,
+                        "category": cat,
+                        "pinned": bool(pinned),
+                    },
+                    default=str,
+                )
+                conn.execute(
+                    """INSERT INTO event_log
+                       (event_type, session_id, agent_id, target,
+                        content_hash, metadata, timestamp)
+                       VALUES (?, ?, NULL, ?, ?, ?, ?)""",
+                    (
+                        "memory_store",
+                        source_session_id,
+                        f"memory:{new_id}",
+                        content_hash,
+                        metadata_blob,
+                        now,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001 — audit must be best-effort
+                logger.debug("memory_store audit failed: %s", exc)
+            return new_id
 
         return self._execute_write(_do)
 
@@ -1705,3 +1763,169 @@ class SessionDB:
         with self._lock:
             row = self._conn.execute(sql, params).fetchone()
         return int(row[0]) if row else 0
+
+    # =====================================================================
+    # Audit log (event_log)
+    # =====================================================================
+
+    def log_event(
+        self,
+        event_type: str,
+        *,
+        session_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        target: Optional[str] = None,
+        content_hash: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Append an event to the audit log.  Returns the new event id.
+
+        ``event_type`` is free-form; the canonical kinds wired up by
+        phalanx are ``tool_call_pre`` / ``tool_call_post`` /
+        ``config_write`` / ``memory_store`` / ``checkpoint_create`` /
+        ``rollback`` / ``guardrail_verdict`` / ``skill_create``.
+
+        ``metadata`` is JSON-encoded.  Failure to serialize falls back
+        to ``str(metadata)`` so the event still lands.
+        """
+        if metadata is None:
+            metadata_json: Optional[str] = None
+        else:
+            try:
+                metadata_json = json.dumps(metadata, default=str)
+            except (TypeError, ValueError):
+                metadata_json = json.dumps(str(metadata))
+
+        ts = timestamp if timestamp is not None else time.time()
+
+        def _do(conn: sqlite3.Connection) -> int:
+            cur = conn.execute(
+                """INSERT INTO event_log
+                   (event_type, session_id, agent_id, target,
+                    content_hash, metadata, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    event_type,
+                    session_id,
+                    agent_id,
+                    target,
+                    content_hash,
+                    metadata_json,
+                    ts,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+        return self._execute_write(_do)
+
+    def get_event(self, event_id: int) -> Optional[Dict[str, Any]]:
+        """Return a single audit event by id, with ``metadata`` decoded."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT * FROM event_log WHERE id = ?", (event_id,)
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        out["metadata"] = self._decode_event_metadata(out.get("metadata"))
+        return out
+
+    def query_events(
+        self,
+        *,
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+        event_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+        target_glob: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """Filtered listing of audit events, newest-first.
+
+        ``target_glob`` uses SQL LIKE semantics — pass ``"tools/%"`` to
+        catch any event whose target sits under ``tools/``.  Passing a
+        glob with no ``%`` matches the literal target.
+        """
+        clauses: List[str] = []
+        params: List[Any] = []
+        if since is not None:
+            clauses.append("timestamp >= ?")
+            params.append(float(since))
+        if until is not None:
+            clauses.append("timestamp <= ?")
+            params.append(float(until))
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if target_glob:
+            clauses.append("target LIKE ?")
+            params.append(target_glob)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = (
+            f"SELECT * FROM event_log {where} "
+            "ORDER BY timestamp DESC, id DESC "
+            "LIMIT ? OFFSET ?"
+        )
+        params.extend([int(limit), int(offset)])
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            entry = dict(row)
+            entry["metadata"] = self._decode_event_metadata(
+                entry.get("metadata")
+            )
+            out.append(entry)
+        return out
+
+    def event_count(
+        self,
+        *,
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+        event_type: Optional[str] = None,
+        session_id: Optional[str] = None,
+        target_glob: Optional[str] = None,
+    ) -> int:
+        """Count audit events matching the same filters as
+        :meth:`query_events`."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if since is not None:
+            clauses.append("timestamp >= ?")
+            params.append(float(since))
+        if until is not None:
+            clauses.append("timestamp <= ?")
+            params.append(float(until))
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        if session_id:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if target_glob:
+            clauses.append("target LIKE ?")
+            params.append(target_glob)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT COUNT(*) FROM event_log {where}"
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return int(row[0]) if row else 0
+
+    @staticmethod
+    def _decode_event_metadata(raw: Any) -> Any:
+        """Best-effort JSON decode for an event's metadata blob."""
+        if raw is None:
+            return None
+        if not isinstance(raw, (str, bytes)):
+            return raw
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return raw

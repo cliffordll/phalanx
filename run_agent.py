@@ -22,6 +22,7 @@ Usage:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -871,22 +872,64 @@ class AIAgent:
         # REQUIRE_APPROVAL.
         guardrail_error = self._guardrail_check(tool_name, arguments)
         if guardrail_error is not None:
+            self._audit_event(
+                "tool_call_pre",
+                target=tool_name,
+                content_hash=self._audit_hash(arguments),
+                metadata={"blocked": True, "reason": guardrail_error},
+            )
             return guardrail_error
 
+        # §2.8.d wave 3 — pre-dispatch audit row (the matching post row
+        # is appended after dispatch so query_events sees the call's
+        # full lifecycle).
+        args_hash = self._audit_hash(arguments)
+        self._audit_event(
+            "tool_call_pre",
+            target=tool_name,
+            content_hash=args_hash,
+        )
+
+        started = time.monotonic()
         try:
             # ``caller_agent`` lets tools that need to inspect the calling
             # AIAgent (currently only delegate_tool — for budget sharing
             # and recursion-depth gating) reach it via dispatch kwargs.
             # All other tools accept the kwarg via ``**_kwargs`` and
             # ignore it, so this is purely additive.
-            return dispatch(
+            result = dispatch(
                 tool_name, arguments,
                 store=self._todo_store,
                 caller_agent=self,
             )
         except Exception as exc:
             logger.exception("tool %s failed", tool_name)
-            return f"[error] tool {tool_name} raised {type(exc).__name__}: {exc}"
+            duration_ms = int((time.monotonic() - started) * 1000)
+            err_text = f"[error] tool {tool_name} raised {type(exc).__name__}: {exc}"
+            self._audit_event(
+                "tool_call_post",
+                target=tool_name,
+                content_hash=args_hash,
+                metadata={
+                    "duration_ms": duration_ms,
+                    "error_type": type(exc).__name__,
+                    "ok": False,
+                },
+            )
+            return err_text
+
+        duration_ms = int((time.monotonic() - started) * 1000)
+        self._audit_event(
+            "tool_call_post",
+            target=tool_name,
+            content_hash=self._audit_hash({"args": arguments, "result": result}),
+            metadata={
+                "duration_ms": duration_ms,
+                "result_size": len(result) if isinstance(result, str) else None,
+                "ok": True,
+            },
+        )
+        return result
 
     def _guardrail_check(
         self, tool_name: str, arguments: Dict[str, Any],
@@ -930,6 +973,18 @@ class AIAgent:
                 "guardrail DENY tool=%s class=%s reason=%s",
                 tool_name, decision.danger_class, decision.reason,
             )
+            self._audit_event(
+                "guardrail_verdict",
+                target=tool_name,
+                metadata={
+                    "verdict": "DENY",
+                    "danger_class": decision.danger_class,
+                    "reason": decision.reason,
+                    "affected_paths": [
+                        str(p) for p in (decision.affected_paths or [])
+                    ],
+                },
+            )
             return (
                 f"[guardrail] DENY {tool_name}: {decision.reason}"
             )
@@ -951,15 +1006,96 @@ class AIAgent:
                 "guardrail APPROVED tool=%s class=%s",
                 tool_name, decision.danger_class,
             )
+            self._audit_event(
+                "guardrail_verdict",
+                target=tool_name,
+                metadata={
+                    "verdict": "APPROVED",
+                    "danger_class": decision.danger_class,
+                    "reason": decision.reason,
+                    "yolo": bool(self.yolo_mode),
+                    "affected_paths": [
+                        str(p) for p in (decision.affected_paths or [])
+                    ],
+                },
+            )
             return None
 
         logger.info(
             "guardrail USER_DENIED tool=%s class=%s",
             tool_name, decision.danger_class,
         )
+        self._audit_event(
+            "guardrail_verdict",
+            target=tool_name,
+            metadata={
+                "verdict": "USER_DENIED",
+                "danger_class": decision.danger_class,
+                "reason": decision.reason,
+                "affected_paths": [
+                    str(p) for p in (decision.affected_paths or [])
+                ],
+            },
+        )
         return (
             f"[guardrail] user denied {tool_name}: {decision.reason}"
         )
+
+    # ── Audit log (§2.8.d wave 3) ──
+
+    def _audit_agent_id(self) -> str:
+        """Compose an agent identifier that captures delegation depth.
+
+        ``<session_id>#d<depth>`` — depth=0 is the user-facing root
+        agent; sub-agents from ``delegate_task`` increment it.  Lets
+        ``phalanx audit log`` distinguish parent and child events that
+        share a session id.
+        """
+        return f"{self.session_id}#d{int(self.delegation_depth)}"
+
+    def _audit_event(
+        self,
+        event_type: str,
+        *,
+        target: Optional[str] = None,
+        content_hash: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Best-effort append to the audit log.
+
+        Silently swallows every exception — audit-log failures must
+        never block tool execution.  No-op when no SessionDB is wired
+        up (e.g. unit-test fixtures that pass ``session_db=None``).
+        """
+        db = self._session_db
+        if db is None:
+            return
+        try:
+            db.log_event(
+                event_type,
+                session_id=self.session_id,
+                agent_id=self._audit_agent_id(),
+                target=target,
+                content_hash=content_hash,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.debug("audit %s failed: %s", event_type, exc)
+
+    @staticmethod
+    def _audit_hash(payload: Any) -> str:
+        """Deterministic SHA256 of a JSON-encoded payload (hex, 64 chars).
+
+        Falls back to ``str(payload)`` when JSON encoding fails — keeps
+        the hash producible even for non-serialisable args.
+        """
+        try:
+            blob = json.dumps(
+                payload, default=str, sort_keys=True, ensure_ascii=False,
+            )
+        except (TypeError, ValueError):
+            blob = str(payload)
+        return hashlib.sha256(blob.encode("utf-8", errors="replace")).hexdigest()
 
     def _get_active_terminal_env(self):
         """Return the active LocalTerminalEnv for this task, or None.

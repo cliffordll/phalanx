@@ -124,6 +124,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("checkpoints",
                "List recent checkpoints",
                "Context", aliases=("snapshots",)),
+    CommandDef("audit",
+               "Show recent audit-log events for this session",
+               "Context", args_hint="[show] [all|<event_type>]",
+               subcommands=("show",)),
 
     # Info ───────────────────────────────────────────────────────────────
     CommandDef("help", "Show available commands", "Info"),

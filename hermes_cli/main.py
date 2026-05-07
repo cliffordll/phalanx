@@ -362,6 +362,44 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_ck.set_defaults(func=cmd_checkpoint_help)
 
+    # audit (§2.8.d wave 3) --------------------------------------------
+    p_au = sub.add_parser(
+        "audit",
+        help="inspect the event_log audit trail",
+    )
+    p_au_sub = p_au.add_subparsers(dest="audit_cmd", metavar="<subcmd>")
+
+    p_au_log = p_au_sub.add_parser("log", help="list events, newest first")
+    p_au_log.add_argument("--since", default=None,
+                          help="only events newer than this (1h / 30m / 2d "
+                               "or ISO 8601 timestamp)")
+    p_au_log.add_argument("--until", default=None,
+                          help="only events older than this (same format as --since)")
+    p_au_log.add_argument("--type", dest="event_type", default=None,
+                          help="filter by event_type (e.g. tool_call_pre)")
+    p_au_log.add_argument("--session", dest="session_id", default=None,
+                          help="filter by session_id")
+    p_au_log.add_argument("--target", dest="target", default=None,
+                          help="filter by target (LIKE pattern, % wildcard)")
+    p_au_log.add_argument("--limit", type=int, default=50)
+    p_au_log.add_argument("--json", action="store_true", dest="emit_json")
+    p_au_log.set_defaults(func=cmd_audit_log)
+
+    p_au_count = p_au_sub.add_parser("count", help="count matching events")
+    p_au_count.add_argument("--since", default=None)
+    p_au_count.add_argument("--until", default=None)
+    p_au_count.add_argument("--type", dest="event_type", default=None)
+    p_au_count.add_argument("--session", dest="session_id", default=None)
+    p_au_count.add_argument("--target", dest="target", default=None)
+    p_au_count.set_defaults(func=cmd_audit_count)
+
+    p_au_show = p_au_sub.add_parser("show", help="dump one event by id")
+    p_au_show.add_argument("event_id", type=int)
+    p_au_show.add_argument("--json", action="store_true", dest="emit_json")
+    p_au_show.set_defaults(func=cmd_audit_show)
+
+    p_au.set_defaults(func=cmd_audit_help)
+
     # logs -------------------------------------------------------------
     p_logs = sub.add_parser("logs", help="tail / filter ~/.hermes/logs/*.log")
     p_logs.add_argument(
@@ -1710,6 +1748,127 @@ def cmd_checkpoint_delete(args: argparse.Namespace) -> int:
         sys.stderr.write(f"error: checkpoint {args.id_or_name!r} not found\n")
         return 2
     print(f"deleted checkpoint {args.id_or_name}")
+    return 0
+
+
+# ── audit commands (§2.8.d wave 3) ──────────────────────────────────────
+
+
+_AUDIT_DURATION_UNITS = {"s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0}
+
+
+def _parse_audit_window(token: Optional[str]) -> Optional[float]:
+    """Resolve a --since / --until token to an absolute epoch second.
+
+    Accepts either a relative duration (``5m`` / ``2h`` / ``1d``) or an
+    ISO 8601 timestamp (``2026-05-07T08:30:00Z``).  Returns ``None`` for
+    a falsy input so callers can pass it straight to query_events.
+    """
+    if not token:
+        return None
+    text = token.strip()
+    if not text:
+        return None
+    if text and text[-1].lower() in _AUDIT_DURATION_UNITS:
+        try:
+            qty = float(text[:-1])
+        except ValueError as exc:
+            raise ValueError(f"bad --since/--until value: {token!r}") from exc
+        unit = _AUDIT_DURATION_UNITS[text[-1].lower()]
+        return time.time() - qty * unit
+    try:
+        from datetime import datetime as _dt
+        # Python 3.11 fromisoformat accepts trailing Z; older Pythons
+        # need the explicit replace.
+        normalised = text.replace("Z", "+00:00")
+        return _dt.fromisoformat(normalised).timestamp()
+    except Exception as exc:
+        raise ValueError(f"bad --since/--until value: {token!r}") from exc
+
+
+def _format_audit_row(row: Dict[str, Any]) -> str:
+    """One-line summary for ``phalanx audit log`` plain output."""
+    from datetime import datetime as _dt
+    ts = float(row.get("timestamp") or 0.0)
+    when = _dt.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    etype = (row.get("event_type") or "?")[:22]
+    target = (row.get("target") or "")[:30]
+    sid = (row.get("session_id") or "")[:8]
+    return (
+        f"{int(row.get('id') or 0):>6}  {when}  "
+        f"{etype:<22s}  {target:<30s}  {sid}"
+    )
+
+
+def cmd_audit_help(args: argparse.Namespace) -> int:
+    print(
+        "usage: phalanx audit <log|count|show> ...\n"
+        "  log [--since X --until X --type T --session S --target G --limit N --json]\n"
+        "  count [--since X --type T --session S --target G]\n"
+        "  show <event_id> [--json]\n"
+        "  --since / --until accept 5m / 2h / 1d or ISO 8601 timestamp\n"
+        "  --target supports SQL LIKE wildcards (e.g. 'tools/%')\n"
+    )
+    return 0
+
+
+def cmd_audit_log(args: argparse.Namespace) -> int:
+    db = _open_session_db_or_exit()
+    try:
+        since = _parse_audit_window(args.since)
+        until = _parse_audit_window(args.until)
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
+    rows = db.query_events(
+        since=since,
+        until=until,
+        event_type=args.event_type,
+        session_id=args.session_id,
+        target_glob=args.target,
+        limit=args.limit,
+    )
+    if getattr(args, "emit_json", False):
+        print(json.dumps(rows, default=str, indent=2))
+        return 0
+    if not rows:
+        print("(no events)")
+        return 0
+    print(f"  {'ID':>6}  {'WHEN':<19s}  {'EVENT':<22s}  {'TARGET':<30s}  SESSION")
+    for r in rows:
+        print(_format_audit_row(r))
+    return 0
+
+
+def cmd_audit_count(args: argparse.Namespace) -> int:
+    db = _open_session_db_or_exit()
+    try:
+        since = _parse_audit_window(args.since)
+        until = _parse_audit_window(args.until)
+    except ValueError as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
+    n = db.event_count(
+        since=since,
+        until=until,
+        event_type=args.event_type,
+        session_id=args.session_id,
+        target_glob=args.target,
+    )
+    print(n)
+    return 0
+
+
+def cmd_audit_show(args: argparse.Namespace) -> int:
+    db = _open_session_db_or_exit()
+    row = db.get_event(args.event_id)
+    if row is None:
+        sys.stderr.write(f"error: event {args.event_id} not found\n")
+        return 2
+    if getattr(args, "emit_json", False):
+        print(json.dumps(row, default=str, indent=2))
+        return 0
+    print(json.dumps(row, default=str, indent=2))
     return 0
 
 

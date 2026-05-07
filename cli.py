@@ -685,6 +685,55 @@ def _cmd_rollback(args: str, state: dict) -> None:
     return None
 
 
+def _cmd_audit(args: str, state: dict) -> None:
+    """Show recent audit-log events for the current session.
+
+    ``/audit`` (no args) → 20 most recent events for the active session.
+    ``/audit show`` → same.
+    ``/audit show all`` → 20 most recent events across every session.
+    ``/audit show <type>`` → 20 most recent of that event_type
+       (``tool_call_pre`` / ``guardrail_verdict`` / ``checkpoint_create`` …)
+       for the active session.
+    """
+    agent = state.get("agent")
+    db = getattr(agent, "_session_db", None) if agent else None
+    if db is None:
+        print("/audit: session DB unavailable in this REPL")
+        return None
+
+    parts = (args or "").strip().split()
+    # Accept `/audit show ...` and `/audit ...` interchangeably.
+    if parts and parts[0] == "show":
+        parts = parts[1:]
+
+    session_filter = getattr(agent, "session_id", None)
+    event_type: Optional[str] = None
+    if parts:
+        if parts[0].lower() == "all":
+            session_filter = None
+        else:
+            event_type = parts[0]
+
+    rows = db.query_events(
+        session_id=session_filter,
+        event_type=event_type,
+        limit=20,
+    )
+    if not rows:
+        scope = "this session" if session_filter else "the audit log"
+        print(f"(no audit events in {scope})")
+        return None
+
+    from datetime import datetime as _dt
+    for r in rows:
+        ts = float(r.get("timestamp") or 0.0)
+        when = _dt.fromtimestamp(ts).strftime("%H:%M:%S")
+        etype = (r.get("event_type") or "?")[:22]
+        target = (r.get("target") or "")[:30]
+        print(f"  {when}  {etype:<22s}  {target}")
+    return None
+
+
 def _cmd_checkpoints(args: str, state: dict) -> None:
     """Print all checkpoints, newest first."""
     mgr = _open_checkpoint_manager_repl()
@@ -721,6 +770,7 @@ _SLASH_HANDLERS: dict[str, Any] = {
     "snapshot":    _cmd_snapshot,
     "rollback":    _cmd_rollback,
     "checkpoints": _cmd_checkpoints,
+    "audit":       _cmd_audit,
     "resume":      _cmd_resume,
     "quit":        _cmd_exit,
     "exit":        _cmd_exit,

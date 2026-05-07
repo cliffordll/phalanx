@@ -312,11 +312,47 @@ class CheckpointManager:
         root: Optional[Path] = None,
         cwd: Optional[Path] = None,
         home: Optional[Path] = None,
+        session_db: Optional[Any] = None,
+        session_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
     ) -> None:
         self._root = Path(root) if root else _checkpoints_root()
         self._root.mkdir(parents=True, exist_ok=True)
         self._cwd = Path(cwd) if cwd else Path.cwd()
         self._home = Path(home) if home else get_hermes_home()
+        # §2.8.d wave 3 — optional audit-log binding.  When ``session_db``
+        # is None (CLI batch mode, fixtures), checkpoint events are
+        # still written to disk but no event_log row is appended.
+        self._session_db = session_db
+        self._session_id = session_id
+        self._agent_id = agent_id
+
+    def _audit_event(
+        self,
+        event_type: str,
+        *,
+        target: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Best-effort append to the audit log.
+
+        Mirrors the safety contract on ``AIAgent._audit_event``: every
+        exception is swallowed because losing an audit entry is far less
+        bad than failing a checkpoint creation.
+        """
+        db = self._session_db
+        if db is None:
+            return
+        try:
+            db.log_event(
+                event_type,
+                session_id=self._session_id,
+                agent_id=self._agent_id,
+                target=target,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.debug("checkpoint audit %s failed: %s", event_type, exc)
 
     # ── Create ────────────────────────────────────────────────────────
 
@@ -377,6 +413,18 @@ class CheckpointManager:
             "yes" if git_sha else "no",
             "yes" if state_backed_up else "no",
             "yes" if config_archived else "no",
+        )
+        self._audit_event(
+            "checkpoint_create",
+            target=ckpt_id,
+            metadata={
+                "name": ckpt.name,
+                "triggered_by": triggered_by,
+                "git_stash": bool(git_sha),
+                "state_db_backed_up": state_backed_up,
+                "config_archived": config_archived,
+                "cwd": str(self._cwd),
+            },
         )
         return ckpt
 
@@ -477,6 +525,17 @@ class CheckpointManager:
                 ckpt.id, "ok" if ok else "FAIL",
             )
 
+        self._audit_event(
+            "rollback",
+            target=ckpt.id,
+            metadata={
+                "name": ckpt.name,
+                "git_stash": bool(ckpt.git_stash_sha),
+                "state_db_restored": bool(ckpt.state_db_path),
+                "config_restored": bool(ckpt.config_tarball_path),
+                "cwd": str(ckpt.cwd),
+            },
+        )
         return ckpt
 
     # ── Delete ────────────────────────────────────────────────────────
