@@ -617,22 +617,113 @@ def _cmd_critic(args: str, state: dict) -> None:
     return None
 
 
+def _open_checkpoint_manager_repl():
+    """Lazy import + construct so a REPL session that never touches
+    /snapshot doesn't pay the import cost upfront."""
+    from tools.checkpoint_manager import CheckpointManager
+    return CheckpointManager()
+
+
+def _cmd_snapshot(args: str, state: dict) -> None:
+    """Create a checkpoint of cwd + state.db + config files.
+
+    ``/snapshot`` (no args) → auto-named timestamped checkpoint.
+    ``/snapshot <name>`` → checkpoint with friendly name (used by
+    ``/rollback <name>``).
+    """
+    name = (args or "").strip() or None
+    try:
+        mgr = _open_checkpoint_manager_repl()
+        ckpt = mgr.create(
+            name=name, description="REPL /snapshot",
+            triggered_by="repl",
+        )
+    except Exception as exc:
+        print(f"(snapshot failed: {exc})")
+        return None
+    pieces = []
+    if ckpt.git_stash_sha:
+        pieces.append(f"git={ckpt.git_stash_sha[:8]}")
+    if ckpt.state_db_path:
+        pieces.append("state.db")
+    if ckpt.config_tarball_path:
+        pieces.append("config")
+    label = f"({name})" if name else ""
+    print(f"📸 checkpoint {ckpt.id} {label}")
+    print(f"   pieces: {', '.join(pieces) or '(empty)'}")
+    return None
+
+
+def _cmd_rollback(args: str, state: dict) -> None:
+    """Restore from a checkpoint.
+
+    ``/rollback`` (no args) → list 5 most recent so user can pick.
+    ``/rollback <id|name>`` → restore.
+    """
+    target = (args or "").strip()
+    mgr = _open_checkpoint_manager_repl()
+    if not target:
+        rows = mgr.list(limit=5)
+        if not rows:
+            print("(no checkpoints — run /snapshot first)")
+            return None
+        print("Recent checkpoints (use /rollback <id|name>):")
+        for c in rows:
+            label = f" ({c.name})" if c.name else ""
+            print(f"  {c.id}{label}")
+        return None
+    ckpt = mgr.get(target)
+    if ckpt is None:
+        print(f"(checkpoint {target!r} not found)")
+        return None
+    try:
+        mgr.rollback(target)
+    except Exception as exc:
+        print(f"(rollback failed: {exc})")
+        return None
+    print(f"⏮  rolled back to {ckpt.id}")
+    return None
+
+
+def _cmd_checkpoints(args: str, state: dict) -> None:
+    """Print all checkpoints, newest first."""
+    mgr = _open_checkpoint_manager_repl()
+    rows = mgr.list(limit=20)
+    if not rows:
+        print("(no checkpoints)")
+        return None
+    for c in rows:
+        label = f" ({c.name})" if c.name else ""
+        pieces = []
+        if c.git_stash_sha:
+            pieces.append("git")
+        if c.state_db_path:
+            pieces.append("db")
+        if c.config_tarball_path:
+            pieces.append("cfg")
+        print(f"  {c.id}{label}  [{'+'.join(pieces) or 'empty'}]")
+    return None
+
+
 # Dispatch table — wave 3 wires the day-to-day handlers.  Anything not
 # listed here that's still in the registry falls through to
 # ``_cmd_stub`` which prints 'not yet implemented'.
 _SLASH_HANDLERS: dict[str, Any] = {
-    "help":    _cmd_help,
-    "new":     _cmd_new,
-    "clear":   _cmd_clear,
-    "history": _cmd_history,
-    "model":   _cmd_model,
-    "debug":   _cmd_debug,
-    "tools":   _cmd_tools,
-    "ref":     _cmd_ref,
-    "critic":  _cmd_critic,
-    "resume":  _cmd_resume,
-    "quit":    _cmd_exit,
-    "exit":    _cmd_exit,
+    "help":        _cmd_help,
+    "new":         _cmd_new,
+    "clear":       _cmd_clear,
+    "history":     _cmd_history,
+    "model":       _cmd_model,
+    "debug":       _cmd_debug,
+    "tools":       _cmd_tools,
+    "ref":         _cmd_ref,
+    "critic":      _cmd_critic,
+    "snapshot":    _cmd_snapshot,
+    "rollback":    _cmd_rollback,
+    "checkpoints": _cmd_checkpoints,
+    "resume":      _cmd_resume,
+    "quit":        _cmd_exit,
+    "exit":        _cmd_exit,
 }
 
 

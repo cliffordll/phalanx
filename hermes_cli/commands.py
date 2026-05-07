@@ -115,6 +115,15 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Spawn a critic sub-agent to review the last assistant reply",
                "Context", args_hint="[help]",
                subcommands=("help",)),
+    CommandDef("snapshot",
+               "Create a checkpoint of cwd + state.db + config",
+               "Context", args_hint="[name]"),
+    CommandDef("rollback",
+               "Restore from a checkpoint (run /snapshot first)",
+               "Context", args_hint="<id|name>"),
+    CommandDef("checkpoints",
+               "List recent checkpoints",
+               "Context", aliases=("snapshots",)),
 
     # Info ───────────────────────────────────────────────────────────────
     CommandDef("help", "Show available commands", "Info"),

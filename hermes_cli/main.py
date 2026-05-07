@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -324,6 +325,42 @@ def _build_parser() -> argparse.ArgumentParser:
     p_mem_pin.set_defaults(func=cmd_memory_pin)
 
     p_mem.set_defaults(func=cmd_memory_help)
+
+    # checkpoint (§2.8.d wave 2) ---------------------------------------
+    p_ck = sub.add_parser(
+        "checkpoint",
+        help="snapshot / list / restore phalanx state (cwd + state.db + config)",
+    )
+    p_ck_sub = p_ck.add_subparsers(dest="checkpoint_cmd", metavar="<subcmd>")
+
+    p_ck_create = p_ck_sub.add_parser("create", help="snapshot current state")
+    p_ck_create.add_argument("--name", default=None,
+                             help="optional friendly name (used for /rollback)")
+    p_ck_create.add_argument("--description", default="",
+                             help="freeform note attached to the checkpoint")
+    p_ck_create.set_defaults(func=cmd_checkpoint_create)
+
+    p_ck_list = p_ck_sub.add_parser("list", help="list checkpoints, newest first")
+    p_ck_list.add_argument("--limit", type=int, default=20)
+    p_ck_list.add_argument("--json", action="store_true", dest="emit_json")
+    p_ck_list.set_defaults(func=cmd_checkpoint_list)
+
+    p_ck_show = p_ck_sub.add_parser("show", help="show one checkpoint's metadata")
+    p_ck_show.add_argument("id_or_name", help="checkpoint ID or friendly name")
+    p_ck_show.set_defaults(func=cmd_checkpoint_show)
+
+    p_ck_rb = p_ck_sub.add_parser("rollback", help="restore from a checkpoint")
+    p_ck_rb.add_argument("id_or_name")
+    p_ck_rb.add_argument("--yes", action="store_true",
+                         help="skip the confirmation prompt")
+    p_ck_rb.set_defaults(func=cmd_checkpoint_rollback)
+
+    p_ck_del = p_ck_sub.add_parser("delete", help="remove a checkpoint")
+    p_ck_del.add_argument("id_or_name")
+    p_ck_del.add_argument("--yes", action="store_true")
+    p_ck_del.set_defaults(func=cmd_checkpoint_delete)
+
+    p_ck.set_defaults(func=cmd_checkpoint_help)
 
     # logs -------------------------------------------------------------
     p_logs = sub.add_parser("logs", help="tail / filter ~/.hermes/logs/*.log")
@@ -1531,6 +1568,148 @@ def cmd_memory_pin(args: argparse.Namespace) -> int:
         return 2
     state = "unpinned" if args.unpin else "pinned"
     print(f"{state} memory {args.memory_id}")
+    return 0
+
+
+# ── checkpoint commands (§2.8.d wave 2) ───────────────────────────────
+
+
+def _open_checkpoint_manager():
+    from tools.checkpoint_manager import CheckpointManager
+    return CheckpointManager()
+
+
+def _format_checkpoint_row(c: Any) -> str:
+    age_s = max(0, time.time() - (c.created_at or 0))
+    if age_s < 60:
+        age = f"{int(age_s)}s"
+    elif age_s < 3600:
+        age = f"{int(age_s / 60)}m"
+    elif age_s < 86400:
+        age = f"{int(age_s / 3600)}h"
+    else:
+        age = f"{int(age_s / 86400)}d"
+    pieces = []
+    if c.git_stash_sha:
+        pieces.append("git")
+    if c.state_db_path:
+        pieces.append("db")
+    if c.config_tarball_path:
+        pieces.append("cfg")
+    name = c.name or "-"
+    return (
+        f"  {c.id:<32s} {age:>6s}  {name:<20s}  "
+        f"[{'+'.join(pieces) or 'empty'}]  {c.description or ''}"
+    )
+
+
+def cmd_checkpoint_help(args: argparse.Namespace) -> int:
+    print(
+        "usage: phalanx checkpoint <create|list|show|rollback|delete> ...\n"
+        "  create [--name N] [--description T]    snapshot current state\n"
+        "  list [--limit N --json]                list newest-first\n"
+        "  show <id|name>                         dump metadata\n"
+        "  rollback <id|name> [--yes]             restore state\n"
+        "  delete <id|name> [--yes]               remove a checkpoint\n"
+    )
+    return 0
+
+
+def cmd_checkpoint_create(args: argparse.Namespace) -> int:
+    mgr = _open_checkpoint_manager()
+    try:
+        ckpt = mgr.create(
+            name=args.name,
+            description=args.description or "",
+            triggered_by="manual",
+        )
+    except Exception as exc:
+        sys.stderr.write(f"error: checkpoint create failed: {exc}\n")
+        return 2
+    pieces = []
+    if ckpt.git_stash_sha:
+        pieces.append(f"git={ckpt.git_stash_sha[:12]}")
+    if ckpt.state_db_path:
+        pieces.append("state.db")
+    if ckpt.config_tarball_path:
+        pieces.append("config")
+    print(f"created checkpoint {ckpt.id}")
+    if ckpt.name:
+        print(f"  name: {ckpt.name}")
+    if ckpt.description:
+        print(f"  description: {ckpt.description}")
+    print(f"  pieces: {', '.join(pieces) or '(empty)'}")
+    return 0
+
+
+def cmd_checkpoint_list(args: argparse.Namespace) -> int:
+    mgr = _open_checkpoint_manager()
+    rows = mgr.list(limit=args.limit)
+    if getattr(args, "emit_json", False):
+        from dataclasses import asdict
+        print(json.dumps([asdict(c) for c in rows], indent=2))
+        return 0
+    if not rows:
+        print("(no checkpoints)")
+        return 0
+    print(f"  {'ID':<32s} {'AGE':>6s}  {'NAME':<20s}  PIECES  DESCRIPTION")
+    for c in rows:
+        print(_format_checkpoint_row(c))
+    return 0
+
+
+def cmd_checkpoint_show(args: argparse.Namespace) -> int:
+    mgr = _open_checkpoint_manager()
+    ckpt = mgr.get(args.id_or_name)
+    if ckpt is None:
+        sys.stderr.write(f"error: checkpoint {args.id_or_name!r} not found\n")
+        return 2
+    from dataclasses import asdict
+    print(json.dumps(asdict(ckpt), indent=2))
+    return 0
+
+
+def cmd_checkpoint_rollback(args: argparse.Namespace) -> int:
+    mgr = _open_checkpoint_manager()
+    ckpt = mgr.get(args.id_or_name)
+    if ckpt is None:
+        sys.stderr.write(f"error: checkpoint {args.id_or_name!r} not found\n")
+        return 2
+    if not args.yes:
+        sys.stderr.write(
+            f"about to roll back to {ckpt.id}\n"
+            f"  cwd:  {ckpt.cwd}\n"
+            f"  this will: "
+            + (f"git stash apply {ckpt.git_stash_sha[:12]}, "
+               if ckpt.git_stash_sha else "")
+            + ("restore state.db, " if ckpt.state_db_path else "")
+            + ("restore config files" if ckpt.config_tarball_path else "")
+            + "\n"
+            "  pass --yes to confirm.\n"
+        )
+        return 1
+    try:
+        mgr.rollback(args.id_or_name)
+    except KeyError:
+        sys.stderr.write(f"error: checkpoint {args.id_or_name!r} not found\n")
+        return 2
+    print(f"rolled back to {ckpt.id}")
+    return 0
+
+
+def cmd_checkpoint_delete(args: argparse.Namespace) -> int:
+    mgr = _open_checkpoint_manager()
+    if not args.yes:
+        sys.stderr.write(
+            f"about to delete checkpoint {args.id_or_name!r}.  "
+            "pass --yes to confirm.\n"
+        )
+        return 1
+    deleted = mgr.delete(args.id_or_name)
+    if not deleted:
+        sys.stderr.write(f"error: checkpoint {args.id_or_name!r} not found\n")
+        return 2
+    print(f"deleted checkpoint {args.id_or_name}")
     return 0
 
 
