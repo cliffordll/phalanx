@@ -1,0 +1,26 @@
+# §2.8.b wave 4 — graceful error path for missing files.
+#
+# The resolver renders unresolvable references as a self-closing
+# <reference type="file" key="..." error="..." /> block.  The model
+# should see the error attribute and acknowledge that the file
+# couldn't be read, rather than hallucinating its contents.  Tests
+# that error blocks reach the model in a useful way.
+task_id: reference_missing_file
+category: reference
+description: |
+  Verifies the resolver renders missing-file errors as <reference />
+  blocks and the agent acknowledges the failure instead of
+  fabricating content.
+
+prompt: |
+  The user attempted to attach a file: `@file:does_not_exist_wave4_marker.txt`.
+
+  This file does not exist on disk.  Look at the <reference> block
+  for it (it should carry an `error="..."` attribute) and reply
+  with a single short sentence that explicitly contains the phrase
+  "not found".  Do NOT invent or guess the file's contents.
+
+verifier_type: exact_match
+expected:
+  contains: ["not found"]
+  case_insensitive: true

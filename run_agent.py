@@ -1705,6 +1705,11 @@ class AIAgent:
         # the resolved content lands in the messages list (and DB) and
         # the model sees it on every retry.  Original user text is
         # preserved as the prefix; resolved blocks are appended.
+        # ``original_user_message`` is kept around for downstream hooks
+        # (compression focus_topic) that want the user's intent, not
+        # the expanded payload — a 100 KB file inlined as focus_topic
+        # would bloat the summariser's prompt for no benefit.
+        original_user_message = user_message
         user_message = self._expand_user_references(user_message)
 
         # Ensure system message is first.
@@ -1770,7 +1775,7 @@ class AIAgent:
             # next API call's estimated prompt would cross the threshold
             # we summarise the protected-middle window before sending.
             messages = self._maybe_compress(
-                messages, focus_topic=user_message,
+                messages, focus_topic=original_user_message,
             )
 
             # API call with classify-and-retry — covers transient network /

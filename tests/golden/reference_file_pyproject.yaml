@@ -1,0 +1,24 @@
+# §2.8.b wave 4 — @file: reference expansion, single file.
+#
+# When the user puts `@file:pyproject.toml` into their prompt, the
+# resolver inlines the file's contents in a <reference type="file"
+# key="pyproject.toml"> ... </reference> block before sending to the
+# model.  The agent should not need to call ``read_file`` because the
+# content is already present in the user message.
+task_id: reference_file_pyproject
+category: reference
+description: |
+  Verifies that an inline @file: reference expands the file content
+  into the user message and the agent can answer questions from that
+  content without invoking a tool call.
+
+prompt: |
+  Read the contents of `@file:pyproject.toml` (already attached
+  inline below).  Reply with exactly the value of the `name = "..."`
+  field from the [project] table.  Output only the project name on
+  a single line, nothing else.
+
+verifier_type: exact_match
+expected:
+  contains: ["phalanx"]
+  case_insensitive: true

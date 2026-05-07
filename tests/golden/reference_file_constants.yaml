@@ -1,0 +1,23 @@
+# §2.8.b wave 4 — @file: reference, structural string lookup.
+#
+# Asks the agent to find the default home directory name from
+# ``hermes_constants.py``.  The resolver inlines the file so the model
+# has the canonical text to extract from; if reference expansion is
+# broken the agent has to read the file via tool which still works
+# but is slower.
+task_id: reference_file_constants
+category: reference
+description: |
+  Confirms @file: expansion delivers a Python module's text and the
+  agent can quote a literal token from it.
+
+prompt: |
+  Inspect `@file:hermes_constants.py`.  In one short sentence,
+  state the literal name of the per-user phalanx home directory
+  (the value used as the default subdirectory under the user's
+  home).  Your answer must include the literal string ".phalanx"
+  somewhere in it.
+
+verifier_type: exact_match
+expected:
+  contains: [".phalanx"]

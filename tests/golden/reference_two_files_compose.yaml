@@ -1,0 +1,29 @@
+# §2.8.b wave 4 — multi-reference composition.
+#
+# Two @file: tokens in one prompt; the resolver appends two separate
+# <reference> blocks.  Catches regressions where multi-match parsing
+# or block ordering breaks.  Asks the agent to confirm both files were
+# received by mentioning a token from each.
+task_id: reference_two_files_compose
+category: reference
+description: |
+  Multi-reference test — agent receives two file blocks and must
+  acknowledge tokens from both, proving each was inlined.
+
+prompt: |
+  I have attached two files: `@file:pyproject.toml` and
+  `@file:agent/__init__.py`.
+
+  Reply on a single line with this exact format:
+
+      RECEIVED pyproject:<project-name> agent_init:<truthy-or-empty>
+
+  Where <project-name> is the literal value of `name = "..."` in
+  pyproject.toml's [project] table, and <truthy-or-empty> is the
+  word "yes" if the agent module's __init__.py file is non-empty,
+  otherwise "empty".
+
+verifier_type: exact_match
+expected:
+  contains: ["RECEIVED", "phalanx"]
+  case_insensitive: true

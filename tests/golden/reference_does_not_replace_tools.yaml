@@ -1,0 +1,26 @@
+# §2.8.b wave 4 — references and tools coexist.
+#
+# Reference expansion is additive: it inlines content, but it doesn't
+# remove the agent's ability to call tools for files that *aren't*
+# referenced.  This task gives the agent one referenced file and asks
+# it to also read a different file via the read_file tool, confirming
+# the tool path is still reachable when references are present.
+task_id: reference_does_not_replace_tools
+category: reference
+description: |
+  Sanity check that @file: expansion does not suppress tool calls
+  for unrelated files — reference expansion is purely additive.
+
+prompt: |
+  I have attached `@file:pyproject.toml` inline.
+
+  Separately, please use the read_file tool to read the file
+  `agent/__init__.py` (do NOT use a reference token for this one —
+  call the tool).  After reading it, reply with the literal token
+  "tool-and-ref-ok" so I can confirm both code paths worked.
+
+verifier_type: tool_called
+expected:
+  tool: read_file
+  args_subset:
+    path: agent/__init__.py
