@@ -238,6 +238,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_tokens": 4096,
         "reasoning_effort": "medium",
     },
+    "memory": {
+        "enabled": True,
+        "retrieve_limit": 5,
+    },
 }
 
 
@@ -270,6 +274,14 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "agent.max_tokens": {
         "type": "number",
         "description": "max_tokens hint passed to the model",
+    },
+    "memory.enabled": {
+        "type": "boolean",
+        "description": "Inject relevant long-term memories at session start",
+    },
+    "memory.retrieve_limit": {
+        "type": "number",
+        "description": "Max memories prepended to the system prompt per turn",
     },
 }
 

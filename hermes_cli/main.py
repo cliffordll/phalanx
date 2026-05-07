@@ -262,6 +262,65 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sess_del.set_defaults(func=cmd_session_delete)
     p_sess.set_defaults(func=cmd_session_help)
 
+    # memory (§2.8.b wave 1) -------------------------------------------
+    p_mem = sub.add_parser(
+        "memory",
+        help="manage long-term memories that prepend to new sessions",
+    )
+    p_mem_sub = p_mem.add_subparsers(dest="memory_cmd", metavar="<subcmd>")
+    p_mem_list = p_mem_sub.add_parser("list", help="list stored memories")
+    p_mem_list.add_argument("--category", default=None,
+                            help="filter by category")
+    p_mem_list.add_argument("--scope", default=None,
+                            choices=["global", "project", "session"],
+                            help="filter by scope")
+    p_mem_list.add_argument("--pinned", action="store_true",
+                            help="show only pinned memories")
+    p_mem_list.add_argument("--limit", type=int, default=50)
+    p_mem_list.add_argument("--json", action="store_true", dest="emit_json")
+    p_mem_list.set_defaults(func=cmd_memory_list)
+
+    p_mem_show = p_mem_sub.add_parser("show", help="show one memory by id")
+    p_mem_show.add_argument("memory_id", type=int)
+    p_mem_show.set_defaults(func=cmd_memory_show)
+
+    p_mem_search = p_mem_sub.add_parser(
+        "search", help="FTS5 search over memory content"
+    )
+    p_mem_search.add_argument("query", help="search text (trigram match)")
+    p_mem_search.add_argument("--limit", type=int, default=10)
+    p_mem_search.add_argument("--scope", default=None,
+                              choices=["global", "project", "session"])
+    p_mem_search.add_argument("--json", action="store_true", dest="emit_json")
+    p_mem_search.set_defaults(func=cmd_memory_search)
+
+    p_mem_add = p_mem_sub.add_parser("add", help="store a new memory")
+    p_mem_add.add_argument("--category", default="note",
+                           help="free-form tag (preference / fact / lesson...)")
+    p_mem_add.add_argument("--scope", default="global",
+                           choices=["global", "project", "session"])
+    p_mem_add.add_argument("--pinned", action="store_true",
+                           help="always include in retrieval")
+    p_mem_add.add_argument("content", nargs="?", default=None,
+                           help="memory text (omit to read from stdin)")
+    p_mem_add.set_defaults(func=cmd_memory_add)
+
+    p_mem_del = p_mem_sub.add_parser("delete", help="delete a memory by id")
+    p_mem_del.add_argument("memory_id", type=int)
+    p_mem_del.add_argument("--yes", action="store_true",
+                           help="skip the confirmation prompt")
+    p_mem_del.set_defaults(func=cmd_memory_delete)
+
+    p_mem_pin = p_mem_sub.add_parser(
+        "pin", help="toggle pinned flag (use --unpin to clear)"
+    )
+    p_mem_pin.add_argument("memory_id", type=int)
+    p_mem_pin.add_argument("--unpin", action="store_true",
+                           help="clear the pinned flag instead of setting it")
+    p_mem_pin.set_defaults(func=cmd_memory_pin)
+
+    p_mem.set_defaults(func=cmd_memory_help)
+
     # logs -------------------------------------------------------------
     p_logs = sub.add_parser("logs", help="tail / filter ~/.hermes/logs/*.log")
     p_logs.add_argument(
@@ -1222,6 +1281,176 @@ def cmd_session_delete(args: argparse.Namespace) -> int:
         sys.stderr.write(f"error: session {sid!r} could not be deleted\n")
         return 2
     print(f"deleted session {sid}")
+    return 0
+
+
+# ── memory commands (§2.8.b wave 1) ────────────────────────────────────
+
+
+def _open_session_db_or_exit():
+    """Open the default SessionDB; exit(2) on failure."""
+    from hermes_state import SessionDB
+    try:
+        return SessionDB()
+    except Exception as exc:
+        sys.stderr.write(f"error: cannot open session DB: {exc}\n")
+        sys.exit(2)
+
+
+def _format_memory_row(row: Dict[str, Any]) -> str:
+    pin = "★" if row.get("pinned") else " "
+    cat = row.get("category") or "?"
+    scope = row.get("scope") or "?"
+    content = (row.get("content") or "").strip().replace("\n", " ")
+    if len(content) > 80:
+        content = content[:77] + "..."
+    return (
+        f"{row.get('id'):>4}  {pin}  {cat:<12s} {scope:<8s} "
+        f"hits={row.get('hit_count') or 0:>3}  {content}"
+    )
+
+
+def cmd_memory_help(args: argparse.Namespace) -> int:
+    print(
+        "usage: phalanx memory <list|show|search|add|delete|pin> ...\n"
+        "  list                 list stored memories (filters: --category --scope --pinned)\n"
+        "  show <id>            print full memory body\n"
+        "  search <query>       FTS5 trigram search\n"
+        "  add [content]        store a new memory (content from stdin if omitted)\n"
+        "  delete <id>          remove a memory\n"
+        "  pin <id> [--unpin]   toggle the pinned flag\n"
+    )
+    return 0
+
+
+def cmd_memory_list(args: argparse.Namespace) -> int:
+    db = _open_session_db_or_exit()
+    try:
+        rows = db.list_memories(
+            category=args.category,
+            scope=args.scope,
+            pinned_only=args.pinned,
+            limit=args.limit,
+        )
+    finally:
+        db.close()
+    if getattr(args, "emit_json", False):
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("(no memories stored)")
+        return 0
+    print(f"{'ID':>4}  P  {'CATEGORY':<12s} {'SCOPE':<8s} {'HITS':<7s} CONTENT")
+    for r in rows:
+        print(_format_memory_row(r))
+    return 0
+
+
+def cmd_memory_show(args: argparse.Namespace) -> int:
+    db = _open_session_db_or_exit()
+    try:
+        row = db.get_memory(args.memory_id)
+    finally:
+        db.close()
+    if not row:
+        sys.stderr.write(f"error: memory {args.memory_id} not found\n")
+        return 2
+    print(f"id          : {row['id']}")
+    print(f"category    : {row.get('category')}")
+    print(f"scope       : {row.get('scope')}")
+    print(f"pinned      : {bool(row.get('pinned'))}")
+    print(f"hit_count   : {row.get('hit_count') or 0}")
+    print(f"created_at  : {row.get('created_at')}")
+    print(f"updated_at  : {row.get('updated_at')}")
+    print(f"last_used   : {row.get('last_used_at')}")
+    src = row.get("source_session_id")
+    if src:
+        print(f"source_sess : {src}")
+    print()
+    print(row.get("content") or "")
+    return 0
+
+
+def cmd_memory_search(args: argparse.Namespace) -> int:
+    db = _open_session_db_or_exit()
+    try:
+        scopes = [args.scope] if args.scope else None
+        # CLI search is read-only — don't bump hit_count, that's reserved
+        # for retrieval into the model's prompt.
+        rows = db.retrieve_memories(
+            args.query, limit=args.limit, scopes=scopes, bump_hits=False
+        )
+    finally:
+        db.close()
+    if getattr(args, "emit_json", False):
+        # Drop the synthetic "score" column from the JSON view since
+        # bm25 magnitude is implementation-dependent and not a stable
+        # contract for downstream consumers.
+        out = [{k: v for k, v in r.items() if k != "score"} for r in rows]
+        print(json.dumps(out, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print(f"(no memories match {args.query!r})")
+        return 0
+    print(f"{'ID':>4}  P  {'CATEGORY':<12s} {'SCOPE':<8s} {'HITS':<7s} CONTENT")
+    for r in rows:
+        print(_format_memory_row(r))
+    return 0
+
+
+def cmd_memory_add(args: argparse.Namespace) -> int:
+    content = args.content
+    if content is None:
+        # stdin path — useful for piping multi-line memory bodies.
+        content = sys.stdin.read()
+    if not content or not content.strip():
+        sys.stderr.write("error: empty memory content\n")
+        return 2
+    db = _open_session_db_or_exit()
+    try:
+        try:
+            mid = db.store_memory(
+                args.category, content,
+                scope=args.scope, pinned=args.pinned,
+            )
+        except ValueError as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return 2
+    finally:
+        db.close()
+    print(f"stored memory id={mid} category={args.category} scope={args.scope}")
+    return 0
+
+
+def cmd_memory_delete(args: argparse.Namespace) -> int:
+    if not args.yes:
+        sys.stderr.write(
+            f"about to delete memory {args.memory_id}.  pass --yes to confirm.\n"
+        )
+        return 1
+    db = _open_session_db_or_exit()
+    try:
+        deleted = db.delete_memory(args.memory_id)
+    finally:
+        db.close()
+    if not deleted:
+        sys.stderr.write(f"error: memory {args.memory_id} not found\n")
+        return 2
+    print(f"deleted memory {args.memory_id}")
+    return 0
+
+
+def cmd_memory_pin(args: argparse.Namespace) -> int:
+    db = _open_session_db_or_exit()
+    try:
+        ok = db.update_memory(args.memory_id, pinned=not args.unpin)
+    finally:
+        db.close()
+    if not ok:
+        sys.stderr.write(f"error: memory {args.memory_id} not found\n")
+        return 2
+    state = "unpinned" if args.unpin else "pinned"
+    print(f"{state} memory {args.memory_id}")
     return 0
 
 

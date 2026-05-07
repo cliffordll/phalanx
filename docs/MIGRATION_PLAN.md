@@ -563,21 +563,23 @@ hermes eval --baseline <run_id> --diff           # 跟刚才的 run 比 verdict 
 
 让 agent 跨 session 累积经验、context 接近上限自动压缩、`@reference` 显式引用文件 / 差异。前置：§2.8.a 跑过 baseline。
 
-| Wave | 内容 | 估行 |
-|---|---|---|
-| 1 | `agent/memory_manager.py` 从 shim 升到真实版本：长期记忆 schema（`hermes_state.py` 加 `memories` 表 + FTS5 索引）、`store_memory(category, content, scope)` / `retrieve_memories(query, limit)`、新 session 起头时自动 prepend 相关 memory chunk 到 system_prompt | ~600 |
-| 2 | `agent/context_compressor.py`：当 token 计数 > 阈值（context_length × 0.7）时，自动让 auxiliary_client 把"最早 N 个 turn"压缩成 summary，替换原 messages；保留最近 K 个 turn 完整；走流式不阻塞用户 | ~400 |
-| 3 | `agent/context_references.py`：`@file:path/to/x.py` `@diff` `@url:...` `@session:<id>` 解析；触发时把内容 inline 到 user message。Slash command `/ref` REPL 版 + `lib/api.ts` 加 `resolveReference` 端点（web 用） | ~500 |
-| 4 | 集成：`AIAgent.run_conversation` 三个 hook 点（turn 起头拉 memory / turn 中检测压缩 / 用户 input 解析 reference），加 5 个新 golden task 验"agent 在长 context / 跨 session / `@file:` 三种场景下行为正确" | ~250 |
+| Wave | 内容 | 估行 | 状态 |
+|---|---|---|---|
+| 1 | `agent/memory_manager.py` 从 shim 升到真实版本：长期记忆 schema（`hermes_state.py` 加 `memories` 表 + FTS5 trigram 索引，schema_version 11→12）、`store_memory` / `retrieve_memories` / `list_memories` / `update_memory` / `delete_memory` / `memory_count`、`MemoryManager.inject_into_system_prompt` 接进 `AIAgent.run_conversation` 仅在 turn 0 触发、`memory.enabled` / `memory.retrieve_limit` 配置项、`phalanx memory list/show/search/add/delete/pin` CLI、43 个新单测 | ~600 | ✅ |
+| 2 | `agent/context_compressor.py`：当 token 计数 > 阈值（context_length × 0.7）时，自动让 auxiliary_client 把"最早 N 个 turn"压缩成 summary，替换原 messages；保留最近 K 个 turn 完整；走流式不阻塞用户 | ~400 | |
+| 3 | `agent/context_references.py`：`@file:path/to/x.py` `@diff` `@url:...` `@session:<id>` 解析；触发时把内容 inline 到 user message。Slash command `/ref` REPL 版 + `lib/api.ts` 加 `resolveReference` 端点（web 用） | ~500 | |
+| 4 | 集成：`AIAgent.run_conversation` 三个 hook 点（turn 起头拉 memory / turn 中检测压缩 / 用户 input 解析 reference），加 5 个新 golden task 验"agent 在长 context / 跨 session / `@file:` 三种场景下行为正确" | ~250 | |
 
-**CLI / REPL 暴露**：
+**CLI / REPL 暴露**（wave 1 已落地的部分用 ✅ 标记）：
 
 ```bash
-hermes memory list                       # 列所有 memory（按 category）
-hermes memory show <id>
-hermes memory delete <id>
-hermes memory search "<query>"           # FTS5
-# REPL 内
+phalanx memory list [--category X --scope global|project|session --pinned]   # ✅
+phalanx memory show <id>                                                      # ✅
+phalanx memory add [--category X --scope X --pinned] [content|<stdin>]        # ✅
+phalanx memory delete <id> [--yes]                                            # ✅
+phalanx memory search "<query>" [--scope X --limit N --json]                  # ✅
+phalanx memory pin <id> [--unpin]                                             # ✅
+# REPL / web 内（wave 3-4）
 > @file:src/foo.py 帮我改这个文件        # 自动 inline 文件内容
 > /ref show                              # 看本 turn 解析了哪些 reference
 > /memory show                            # 看本 session 起头拉了哪些 memory

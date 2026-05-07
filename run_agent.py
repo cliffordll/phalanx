@@ -659,6 +659,13 @@ class AIAgent:
         self._cached_system_prompt: Optional[str] = None
         self.platform = platform
 
+        # Long-term memory (§2.8.b wave 1).  Bound lazily on first
+        # ``run_conversation`` so swapping ``self._session_db`` after
+        # construction (test fixtures, gateway hand-off) is still
+        # respected.  ``memory.enabled`` config knob can disable
+        # injection without removing the binding.
+        self._memory_manager: Optional[Any] = None
+
         # Per-conversation usage accumulator (§2.8.a wave 3).  Populated
         # by ``_accumulate_usage`` after every successful API round-trip
         # and reset at the start of ``run_conversation``.  Lets the eval
@@ -1332,6 +1339,58 @@ class AIAgent:
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
 
+    # ── long-term memory injection (§2.8.b wave 1) ──────────────────
+
+    def _get_memory_manager(self) -> Optional[Any]:
+        """Resolve a MemoryManager bound to ``self._session_db``.
+
+        Returns None when memory is config-disabled or no DB is bound.
+        Cached on first build so per-turn lookup costs nothing once
+        warmed.
+        """
+        if self._memory_manager is not None:
+            return self._memory_manager
+        if self._session_db is None:
+            return None
+        try:
+            from hermes_cli.config import load_config, cfg_get
+            cfg = load_config()
+            enabled = bool(cfg_get(cfg, "memory", "enabled", default=True))
+            limit = int(
+                cfg_get(cfg, "memory", "retrieve_limit", default=5) or 5
+            )
+        except Exception:
+            enabled, limit = True, 5
+        try:
+            from agent.memory_manager import MemoryManager
+            self._memory_manager = MemoryManager(
+                self._session_db,
+                enabled=enabled,
+                limit=limit,
+            )
+        except Exception as exc:
+            logger.debug("MemoryManager bind failed: %s", exc)
+            return None
+        return self._memory_manager
+
+    def _inject_memory_block(self, system_prompt: str, query: str) -> str:
+        """Prepend retrieved memories to *system_prompt* on turn 0.
+
+        Failures are swallowed — memory injection must never break the
+        agent loop.  Returns the unchanged prompt when retrieval is
+        disabled or yields nothing.
+        """
+        manager = self._get_memory_manager()
+        if manager is None or not manager.enabled:
+            return system_prompt
+        try:
+            return manager.inject_into_system_prompt(
+                system_prompt, query=query
+            )
+        except Exception as exc:
+            logger.debug("memory injection skipped: %s", exc)
+            return system_prompt
+
     # ── main conversation loop ───────────────────────────────────────
 
     def run_conversation(
@@ -1386,6 +1445,15 @@ class AIAgent:
             ephemeral=self.ephemeral_system_prompt,
             cwd=os.getcwd(),
         )
+
+        # §2.8.b wave 1 — prepend relevant long-term memories.  Only
+        # fires on turn 0 of a session (no replayed conversation_history),
+        # so /resume keeps the previously snapshotted prompt intact.
+        if not conversation_history:
+            effective_system = self._inject_memory_block(
+                effective_system, user_message
+            )
+
         # Ensure system message is first.
         if not messages or messages[0].get("role") != "system":
             messages.insert(0, {"role": "system", "content": effective_system})

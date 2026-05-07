@@ -41,7 +41,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -102,10 +102,26 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    category TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'global',
+    content TEXT NOT NULL,
+    source_session_id TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    hit_count INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    last_used_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope);
+CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned DESC, updated_at DESC);
 """
 
 FTS_SQL = """
@@ -156,6 +172,35 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON message
         new.id,
         COALESCE(new.content, '') || ' ' || COALESCE(new.tool_name, '') || ' ' || COALESCE(new.tool_calls, '')
     );
+END;
+"""
+
+# Memories FTS5: trigram tokenizer for substring + CJK matches.  Memories
+# are short (a paragraph at most), so a single trigram index handles both
+# English keyword and CJK substring lookups without the unicode61 + trigram
+# split that messages_fts uses.  category and scope are mirrored into the
+# FTS row so search can filter / boost on them.
+MEMORIES_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    content,
+    category UNINDEXED,
+    scope UNINDEXED,
+    tokenize='trigram'
+);
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, content, category, scope)
+    VALUES (new.id, new.content, new.category, new.scope);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_delete AFTER DELETE ON memories BEGIN
+    DELETE FROM memories_fts WHERE rowid = old.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_update AFTER UPDATE ON memories BEGIN
+    DELETE FROM memories_fts WHERE rowid = old.id;
+    INSERT INTO memories_fts(rowid, content, category, scope)
+    VALUES (new.id, new.content, new.category, new.scope);
 END;
 """
 
@@ -484,6 +529,18 @@ class SessionDB:
                     "COALESCE(tool_calls, '') "
                     "FROM messages"
                 )
+            if current_version < 12:
+                # v12: long-term memories table + FTS5 trigram index.
+                # The CREATE TABLE in SCHEMA_SQL covers the row store
+                # (and _reconcile_columns picks up future column adds);
+                # FTS virtual table + triggers need an explicit script
+                # because executescript can't reliably pair them with
+                # IF NOT EXISTS.  Existing DBs have no memories rows to
+                # backfill, so this is just a structural migration.
+                try:
+                    cursor.execute("SELECT 1 FROM memories_fts LIMIT 0")
+                except sqlite3.OperationalError:
+                    cursor.executescript(MEMORIES_FTS_SQL)
             if current_version < SCHEMA_VERSION:
                 cursor.execute(
                     "UPDATE schema_version SET version = ?",
@@ -511,6 +568,11 @@ class SessionDB:
             cursor.execute("SELECT * FROM messages_fts_trigram LIMIT 0")
         except sqlite3.OperationalError:
             cursor.executescript(FTS_TRIGRAM_SQL)
+
+        try:
+            cursor.execute("SELECT * FROM memories_fts LIMIT 0")
+        except sqlite3.OperationalError:
+            cursor.executescript(MEMORIES_FTS_SQL)
 
         self._conn.commit()
 
@@ -1318,3 +1380,328 @@ class SessionDB:
             ):
                 return False
         return False
+
+    # =====================================================================
+    # Long-term memory (§2.8.b wave 1)
+    # =====================================================================
+    #
+    # The ``memories`` table stores cross-session knowledge an agent has
+    # accumulated about the user / project.  Compared to ``messages``:
+    #
+    # * messages are turn-scoped, indexed by session_id, and replayed
+    #   verbatim into prompts on resume — they're a transcript.
+    # * memories are session-detached, queried by topical relevance
+    #   ('@pytest preference?'), and only the relevant subset is
+    #   prepended to the system prompt at the start of a *new* session.
+    #
+    # Retrieval ranks by FTS5 bm25 against a query string, with a
+    # boost for ``pinned=1`` and a small recency tiebreaker.  Pinned
+    # memories with no query match still surface (scope='global' only)
+    # so 'always-true' facts ("user prefers terse answers") don't get
+    # gated on token-string overlap.
+
+    _MEMORY_SCOPES = {"global", "project", "session"}
+
+    def store_memory(
+        self,
+        category: str,
+        content: str,
+        *,
+        scope: str = "global",
+        source_session_id: Optional[str] = None,
+        pinned: bool = False,
+    ) -> int:
+        """Insert a memory and return its row ID.
+
+        ``category`` is a free-form string (e.g. 'preference', 'fact',
+        'lesson') — used for filtering and display, not for retrieval
+        ranking.  ``scope`` is one of {global, project, session};
+        anything else is rejected so future query helpers can rely on
+        the closed set.
+        """
+        if not content or not content.strip():
+            raise ValueError("memory content must be non-empty")
+        if scope not in self._MEMORY_SCOPES:
+            raise ValueError(
+                f"memory scope must be one of {sorted(self._MEMORY_SCOPES)}, "
+                f"got {scope!r}"
+            )
+        cat = (category or "").strip() or "note"
+        content = content.strip()
+        now = time.time()
+
+        def _do(conn: sqlite3.Connection) -> int:
+            cursor = conn.execute(
+                """INSERT INTO memories
+                   (category, scope, content, source_session_id,
+                    pinned, hit_count, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 0, ?, ?)""",
+                (cat, scope, content, source_session_id,
+                 1 if pinned else 0, now, now),
+            )
+            return cursor.lastrowid
+
+        return self._execute_write(_do)
+
+    def update_memory(
+        self,
+        memory_id: int,
+        *,
+        content: Optional[str] = None,
+        category: Optional[str] = None,
+        scope: Optional[str] = None,
+        pinned: Optional[bool] = None,
+    ) -> bool:
+        """Patch a memory in place; returns True iff the row existed.
+
+        Bumps ``updated_at`` whenever any field changes.  Caller passes
+        only the fields they want to mutate.
+        """
+        if scope is not None and scope not in self._MEMORY_SCOPES:
+            raise ValueError(
+                f"memory scope must be one of {sorted(self._MEMORY_SCOPES)}, "
+                f"got {scope!r}"
+            )
+        sets: List[str] = []
+        params: List[Any] = []
+        if content is not None:
+            stripped = content.strip()
+            if not stripped:
+                raise ValueError("memory content must be non-empty")
+            sets.append("content = ?")
+            params.append(stripped)
+        if category is not None:
+            sets.append("category = ?")
+            params.append((category or "").strip() or "note")
+        if scope is not None:
+            sets.append("scope = ?")
+            params.append(scope)
+        if pinned is not None:
+            sets.append("pinned = ?")
+            params.append(1 if pinned else 0)
+        if not sets:
+            return self.get_memory(memory_id) is not None
+        sets.append("updated_at = ?")
+        params.append(time.time())
+        params.append(memory_id)
+        sql = f"UPDATE memories SET {', '.join(sets)} WHERE id = ?"
+
+        def _do(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(sql, params)
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def get_memory(self, memory_id: int) -> Optional[Dict[str, Any]]:
+        """Fetch a single memory by ID, or None when absent."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def delete_memory(self, memory_id: int) -> bool:
+        """Delete a memory.  Returns True iff the row existed."""
+        def _do(conn: sqlite3.Connection) -> bool:
+            cursor = conn.execute(
+                "DELETE FROM memories WHERE id = ?", (memory_id,)
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def list_memories(
+        self,
+        *,
+        category: Optional[str] = None,
+        scope: Optional[str] = None,
+        pinned_only: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """List memories newest-first with optional filters.
+
+        Pinned memories sort first, then by ``updated_at DESC`` — same
+        order the CLI ``memory list`` view will use.
+        """
+        clauses: List[str] = []
+        params: List[Any] = []
+        if category:
+            clauses.append("category = ?")
+            params.append(category)
+        if scope:
+            clauses.append("scope = ?")
+            params.append(scope)
+        if pinned_only:
+            clauses.append("pinned = 1")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = (
+            f"SELECT * FROM memories {where} "
+            "ORDER BY pinned DESC, updated_at DESC, id DESC "
+            "LIMIT ? OFFSET ?"
+        )
+        params.extend([limit, offset])
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def _fts_escape(query: str) -> str:
+        """Quote a free-text query for FTS5 MATCH.
+
+        The trigram tokenizer doesn't need column-prefix syntax; we
+        just need to (a) drop control chars, (b) split on whitespace,
+        (c) double-quote each token to neutralise FTS5 operators
+        (``AND``/``OR``/``NOT``/``"``/``*`` etc.) that would otherwise
+        be interpreted from user input.  Empty query → empty string,
+        which the caller treats as "skip MATCH and just sort by
+        recency".
+        """
+        if not query:
+            return ""
+        tokens: List[str] = []
+        for raw in query.split():
+            cleaned = "".join(
+                ch for ch in raw if ch.isprintable() and ch != '"'
+            ).strip()
+            if cleaned:
+                tokens.append(f'"{cleaned}"')
+        return " ".join(tokens)
+
+    def retrieve_memories(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        scopes: Optional[List[str]] = None,
+        category: Optional[str] = None,
+        bump_hits: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Return memories most relevant to *query*, ranked.
+
+        Strategy:
+        * Run FTS5 MATCH against ``memories_fts`` (trigram tokenizer)
+          to get the candidate set with bm25 score.
+        * Always also include all ``pinned=1`` rows in the requested
+          scopes, even when they don't match — the bm25 score for
+          those is set to 0 so they sort by the recency tiebreaker
+          unless they also matched.
+        * Final order: pinned first (DESC), then bm25 ASC (smaller =
+          more relevant in SQLite's bm25), then ``updated_at`` DESC.
+        * Caps at *limit* rows.
+
+        When ``bump_hits=True`` (default), ``hit_count`` and
+        ``last_used_at`` are updated for every returned row — this is
+        the signal CLI ``memory list --hot`` will use later.  Tests
+        / one-off lookups can pass ``bump_hits=False`` to peek
+        without affecting ranking.
+        """
+        if scopes is not None:
+            unknown = [s for s in scopes if s not in self._MEMORY_SCOPES]
+            if unknown:
+                raise ValueError(f"unknown memory scope(s): {unknown}")
+        scope_filter = list(scopes) if scopes else list(self._MEMORY_SCOPES)
+        scope_placeholders = ",".join("?" for _ in scope_filter)
+
+        match_query = self._fts_escape(query)
+        rows: Dict[int, Dict[str, Any]] = {}
+
+        with self._lock:
+            if match_query:
+                # bm25() smaller is better; aliasing it as `score`
+                # keeps the ORDER BY readable.
+                cat_clause = " AND m.category = ?" if category else ""
+                params: List[Any] = [match_query]
+                params.extend(scope_filter)
+                if category:
+                    params.append(category)
+                params.append(limit * 4)
+                cursor = self._conn.execute(
+                    f"""
+                    SELECT m.*, bm25(memories_fts) AS score
+                    FROM memories_fts
+                    JOIN memories m ON m.id = memories_fts.rowid
+                    WHERE memories_fts MATCH ?
+                      AND m.scope IN ({scope_placeholders})
+                      {cat_clause}
+                    ORDER BY score ASC
+                    LIMIT ?
+                    """,
+                    params,
+                )
+                for r in cursor.fetchall():
+                    d = dict(r)
+                    rows[d["id"]] = d
+            # Always blend in pinned rows in scope, even without match.
+            cat_clause = " AND category = ?" if category else ""
+            pin_params: List[Any] = list(scope_filter)
+            if category:
+                pin_params.append(category)
+            cursor = self._conn.execute(
+                f"""
+                SELECT *, 0.0 AS score FROM memories
+                WHERE pinned = 1
+                  AND scope IN ({scope_placeholders})
+                  {cat_clause}
+                """,
+                pin_params,
+            )
+            for r in cursor.fetchall():
+                d = dict(r)
+                # Don't overwrite a higher-scoring matched row.
+                if d["id"] not in rows:
+                    rows[d["id"]] = d
+
+        ordered = sorted(
+            rows.values(),
+            key=lambda r: (
+                -int(r.get("pinned") or 0),
+                float(r.get("score") or 0.0),
+                -float(r.get("updated_at") or 0.0),
+            ),
+        )[:limit]
+
+        if bump_hits and ordered:
+            ids = [int(r["id"]) for r in ordered]
+            now = time.time()
+            placeholders = ",".join("?" for _ in ids)
+
+            def _do(conn: sqlite3.Connection) -> None:
+                conn.execute(
+                    f"UPDATE memories SET hit_count = hit_count + 1, "
+                    f"last_used_at = ? WHERE id IN ({placeholders})",
+                    [now, *ids],
+                )
+
+            try:
+                self._execute_write(_do)
+                for r in ordered:
+                    r["hit_count"] = int(r.get("hit_count") or 0) + 1
+                    r["last_used_at"] = now
+            except Exception as exc:
+                # Bump failures shouldn't poison retrieval — log and
+                # return the rows as-is.
+                logger.debug("memory hit-bump failed: %s", exc)
+
+        return ordered
+
+    def memory_count(
+        self,
+        *,
+        scope: Optional[str] = None,
+        category: Optional[str] = None,
+    ) -> int:
+        """Count memories matching the same filters as ``list_memories``."""
+        clauses: List[str] = []
+        params: List[Any] = []
+        if scope:
+            clauses.append("scope = ?")
+            params.append(scope)
+        if category:
+            clauses.append("category = ?")
+            params.append(category)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sql = f"SELECT COUNT(*) FROM memories {where}"
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return int(row[0]) if row else 0
