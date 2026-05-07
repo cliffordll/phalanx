@@ -21,3 +21,4 @@ from tools import terminal_tool  # noqa: F401  # Phase 2.2 wave 1: minimal local
 from tools import file_tools  # noqa: F401  # Phase 2.2 wave 1: read_file / write_file / patch / search_files
 from tools import todo_tool  # noqa: F401  # Phase 2.2 wave 2: in-memory task list (per-AIAgent store)
 from tools import web_tools  # noqa: F401  # Phase 2.2 wave 4: web_search / web_extract / web_crawl
+from tools import delegate_tool  # noqa: F401  # Phase 2.8.c wave 1: spawn sub-agent

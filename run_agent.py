@@ -688,6 +688,16 @@ class AIAgent:
         self._reference_resolver: Optional[Any] = None
         self._last_resolved_refs: List[Any] = []
 
+        # Delegation depth (§2.8.c wave 1).  Sub-agents created via
+        # ``tools.delegate_tool.delegate_task`` inherit the parent's
+        # depth + 1; ``delegate_tool`` rejects calls past
+        # ``_DELEGATION_DEPTH_MAX`` (default 2) so a chain like
+        # main→critic→nested-critic is allowed but
+        # main→A→B→C is refused.  The parent's IterationBudget is
+        # *also* shared so total cost is bounded — depth is a
+        # complementary structural guard.
+        self.delegation_depth: int = 0
+
         # Per-conversation usage accumulator (§2.8.a wave 3).  Populated
         # by ``_accumulate_usage`` after every successful API round-trip
         # and reset at the start of ``run_conversation``.  Lets the eval
@@ -833,7 +843,16 @@ class AIAgent:
         if not callable(dispatch):
             return f"[error] tools.registry has no dispatch(); cannot run {tool_name!r}"
         try:
-            return dispatch(tool_name, arguments, store=self._todo_store)
+            # ``caller_agent`` lets tools that need to inspect the calling
+            # AIAgent (currently only delegate_tool — for budget sharing
+            # and recursion-depth gating) reach it via dispatch kwargs.
+            # All other tools accept the kwarg via ``**_kwargs`` and
+            # ignore it, so this is purely additive.
+            return dispatch(
+                tool_name, arguments,
+                store=self._todo_store,
+                caller_agent=self,
+            )
         except Exception as exc:
             logger.exception("tool %s failed", tool_name)
             return f"[error] tool {tool_name} raised {type(exc).__name__}: {exc}"
