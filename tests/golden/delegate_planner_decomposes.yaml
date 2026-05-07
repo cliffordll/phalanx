@@ -1,0 +1,25 @@
+# §2.8.c wave 4 — planner role decomposes a task.
+#
+# delegate_task(role="planner") should produce a numbered step plan
+# ending with an ESTIMATE line.  Verifier checks for at least three
+# numbered steps in the agent's reply (which should be the
+# planner's verbatim output).  Looking for "1." through "3." at
+# minimum is a low bar — most planner outputs will exceed it.
+task_id: delegate_planner_decomposes
+category: delegate
+description: |
+  Planner sub-agent must emit a numbered step plan when asked to
+  decompose a task.  Verifies the planner system prompt actually
+  drives the structured-output contract.
+
+prompt: |
+  Use the delegate_task tool with role="planner" to decompose
+  this task: "Add a CLI flag --dry-run to phalanx eval that
+  skips persistence and only prints the report".
+
+  After the planner returns, copy its final_response verbatim
+  into your reply.
+
+verifier_type: exact_match
+expected:
+  contains: ["1.", "2.", "3."]

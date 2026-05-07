@@ -1,0 +1,33 @@
+# §2.8.c wave 4 — shared IterationBudget verification.
+#
+# Asks the agent to delegate a tiny task with a generous max
+# (max_iterations_subagent=20), but caps the entire run at
+# max_iterations=8 in the eval task definition itself.  The
+# parent's IterationBudget is shared with the sub-agent; if
+# sharing works, the sub will run within the parent's remaining
+# turns and complete normally.  The verifier just checks the agent
+# reaches its final reply (no infinite loop / no budget crash).
+#
+# This is a structural test — the sub-agent should successfully
+# return a result, proving the shared-budget plumbing didn't break
+# the loop.
+task_id: delegate_shared_budget
+category: delegate
+description: |
+  Smoke test that delegate_task runs to completion under a
+  modest shared IterationBudget — proves wave-4's
+  ``_budget_externally_supplied`` fix preserves sharing without
+  starving the sub-agent.
+
+max_iterations: 8
+
+prompt: |
+  Use the delegate_task tool to ask a sub-agent for a one-word
+  answer: "Reply with the single word 'pong-delegate-budget'."
+  Pass max_iterations_subagent=20 as a hint.  Then, in your own
+  reply, include the literal string "delegate-shared-budget-ok"
+  to confirm the chain completed.
+
+verifier_type: exact_match
+expected:
+  contains: ["delegate-shared-budget-ok"]

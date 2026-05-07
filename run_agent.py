@@ -601,6 +601,13 @@ class AIAgent:
 
         self.model = model
         self.max_iterations = max_iterations
+        # Track whether the budget was injected externally (e.g. by
+        # delegate_tool sharing the parent's IterationBudget).  When
+        # external, run_conversation must NOT reset it on each turn —
+        # otherwise sub-agents that inherit a parent's budget end up
+        # with a fresh counter per call, defeating the whole point of
+        # bounded fan-out cost.
+        self._budget_externally_supplied: bool = iteration_budget is not None
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
         self.tool_delay = tool_delay
         self.enabled_toolsets = list(enabled_toolsets) if enabled_toolsets else []
@@ -1688,8 +1695,13 @@ class AIAgent:
             ``{"final_response": str, "messages": list, "api_calls": int,
               "stop_reason": str, "iterations_used": int}``
         """
-        # Per-turn budget reset — matches upstream behavior.
-        self.iteration_budget = IterationBudget(self.max_iterations)
+        # Per-turn budget reset — matches upstream behavior, but skip
+        # the reset when the budget was injected externally (sub-agent
+        # path).  External budgets are owned by the caller; resetting
+        # them here would sever the shared-counter contract that
+        # delegate_tool depends on.
+        if not self._budget_externally_supplied:
+            self.iteration_budget = IterationBudget(self.max_iterations)
         self._interrupt_requested = False
         self._current_task_id = task_id or str(uuid.uuid4())
         self._stream_callback = stream_callback

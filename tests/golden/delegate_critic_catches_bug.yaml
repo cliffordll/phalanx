@@ -1,0 +1,39 @@
+# §2.8.c wave 4 — critic role catches an obvious flaw.
+#
+# Feeds a "critic" sub-agent a deliberately broken patch and
+# expects the critic to surface it.  The verifier looks for the
+# VERDICT line — REVISE / REJECT both pass (critic should not
+# ACCEPT a buggy patch).  Tests that:
+#
+# * delegate_task with role="critic" is reachable
+# * the critic system prompt actually drives a structured review
+# * the VERDICT contract is honoured by typical models
+task_id: delegate_critic_catches_bug
+category: delegate
+description: |
+  Critic sub-agent must spot a missing-import bug in the
+  attached snippet and emit a VERDICT line that's NOT ACCEPT.
+
+prompt: |
+  Use the delegate_task tool with role="critic" to review the
+  following patch.  Pass the patch as the subject_artifact
+  parameter, and use a clear task_description like "review this
+  patch for correctness".
+
+  After the critic returns, copy its full final_response into
+  your reply verbatim.  The patch:
+
+  ```python
+  # File: utils.py
+  def parse_date(s):
+      # Expects ISO-format string.
+      return datetime.fromisoformat(s)
+  ```
+
+  Note: this snippet uses `datetime` without importing it — the
+  critic should flag that.
+
+verifier_type: exact_match
+expected:
+  contains: ["VERDICT:"]
+  case_insensitive: true

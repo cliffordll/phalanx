@@ -1,0 +1,32 @@
+# §2.8.c wave 4 — depth gate verification.
+#
+# This task is intentionally rigged so the agent has to attempt a
+# delegate from inside a delegate.  The chain hits the
+# _DELEGATION_DEPTH_MAX=2 boundary (parent depth=0 → child
+# depth=1 → grandchild depth=2 — but the gate fires when a depth=2
+# agent tries to spawn).  We expect the agent to surface the
+# "max depth" error message since the inner delegate fails.
+#
+# The verifier doesn't enforce a particular phrasing of the user
+# reply — just that "max depth" appears somewhere, which is the
+# error string the gate emits.
+task_id: delegate_recursion_capped
+category: delegate
+description: |
+  Verifies the delegation-depth gate by asking the agent to
+  attempt a deep delegation chain; the inner-most delegate call
+  must surface the "max depth" tool_error rather than spawning.
+
+prompt: |
+  Please use the delegate_task tool with role="executor" to ask
+  a sub-agent to do this: "From inside this sub-task, delegate
+  again to another sub-agent, asking it to delegate yet again
+  to a third sub-agent.  Three nested delegates."
+
+  After the chain completes (or fails), include in your reply
+  the literal phrase the depth gate prints when it refuses.
+
+verifier_type: exact_match
+expected:
+  contains: ["max delegation depth"]
+  case_insensitive: true

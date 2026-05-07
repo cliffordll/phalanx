@@ -1,0 +1,27 @@
+# §2.8.c wave 4 — basic delegate use-case.
+#
+# When the agent encounters a task that benefits from up-front
+# planning, it should delegate to a planner sub-agent before
+# executing.  This task gives the agent a multi-step prompt that
+# explicitly mentions "before executing, delegate planning" so the
+# expected behaviour is unambiguous.  The verifier just checks that
+# the delegate_task tool was actually invoked — content of the plan
+# is the planner's job, not what we're testing here.
+task_id: delegate_basic_split
+category: delegate
+description: |
+  Smoke test for delegate_task — agent receives a prompt that
+  asks it to plan-then-execute, and is expected to call
+  delegate_task at least once (typically with role="planner") to
+  decompose before acting.
+
+prompt: |
+  I want you to refactor a hypothetical function `process_orders`.
+  Before suggesting any concrete changes, please first delegate
+  the planning step to a sub-agent (use the delegate_task tool
+  with role="planner") so we have a clear plan.  Then summarise
+  the plan you got back.
+
+verifier_type: tool_called
+expected:
+  tool: delegate_task
