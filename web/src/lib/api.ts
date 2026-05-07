@@ -259,4 +259,27 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ key }),
     }),
+
+  // references (§2.8.b wave 3)
+  resolveReferences: (text: string) =>
+    fetchJSON<ResolveReferencesResponse>("/api/references/resolve", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    }),
 };
+
+// ── References (§2.8.b wave 3) ────────────────────────────────────────
+
+export interface ResolvedReference {
+  type: "file" | "diff" | "url" | "session" | string;
+  key: string;
+  content: string;
+  error: string | null;
+  content_chars: number;
+}
+
+export interface ResolveReferencesResponse {
+  rewritten_text: string;
+  resolved: ResolvedReference[];
+}

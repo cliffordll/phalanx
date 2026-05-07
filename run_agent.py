@@ -679,6 +679,15 @@ class AIAgent:
         self._compressor: Optional[Any] = None
         self._compressor_skipped: bool = False
 
+        # Inline @-reference resolver (§2.8.b wave 3).  Built lazily
+        # on first user message that contains an @-token; cached so the
+        # /ref slash command can ask "what got expanded last turn".
+        # ``_last_resolved_refs`` is reset at the start of every
+        # ``run_conversation`` call so /ref show only describes the
+        # most recent expansion.
+        self._reference_resolver: Optional[Any] = None
+        self._last_resolved_refs: List[Any] = []
+
         # Per-conversation usage accumulator (§2.8.a wave 3).  Populated
         # by ``_accumulate_usage`` after every successful API round-trip
         # and reset at the start of ``run_conversation``.  Lets the eval
@@ -1418,6 +1427,61 @@ class AIAgent:
             logger.debug("memory injection skipped: %s", exc)
             return system_prompt
 
+    # ── inline @-reference resolution (§2.8.b wave 3) ───────────────
+
+    def _get_reference_resolver(self) -> Optional[Any]:
+        """Build (and cache) the :class:`ReferenceResolver` for this agent.
+
+        Bound to the agent's *current working directory* and
+        ``self._session_db``.  Returns ``None`` if the resolver module
+        cannot import (would be surprising — context_references.py has
+        no heavyweight deps).
+        """
+        if self._reference_resolver is not None:
+            return self._reference_resolver
+        try:
+            from agent.context_references import ReferenceResolver
+            self._reference_resolver = ReferenceResolver(
+                cwd=os.getcwd(),
+                session_db=self._session_db,
+            )
+        except Exception as exc:
+            logger.debug("ReferenceResolver bind failed: %s", exc)
+            return None
+        return self._reference_resolver
+
+    def _expand_user_references(self, user_message: str) -> str:
+        """Expand any ``@<kind>[:<value>]`` tokens in *user_message*.
+
+        Returns the rewritten message with ``<reference>`` blocks
+        appended.  Stores the per-reference outcome on
+        ``self._last_resolved_refs`` so the REPL ``/ref show`` command
+        can introspect what was expanded.  Failures inside the
+        resolver are swallowed — at worst the user sees their original
+        message reach the model unchanged.
+        """
+        self._last_resolved_refs = []
+        if not user_message or "@" not in user_message:
+            return user_message
+        resolver = self._get_reference_resolver()
+        if resolver is None:
+            return user_message
+        try:
+            rewritten, resolved = resolver.resolve(user_message)
+        except Exception as exc:
+            logger.debug("reference resolution skipped: %s", exc)
+            return user_message
+        self._last_resolved_refs = resolved
+        if resolved:
+            self._vprint(
+                f"[ref] expanded {len(resolved)} reference(s): "
+                + ", ".join(
+                    f"@{r.type}:{r.key}" if r.key else f"@{r.type}"
+                    for r in resolved
+                )
+            )
+        return rewritten
+
     # ── context compression (§2.8.b wave 2) ─────────────────────────
 
     def _get_compressor(self) -> Optional[Any]:
@@ -1635,6 +1699,13 @@ class AIAgent:
             effective_system = self._inject_memory_block(
                 effective_system, user_message
             )
+
+        # §2.8.b wave 3 — expand @file: / @diff / @url: / @session:
+        # references in the user message.  Runs before persistence so
+        # the resolved content lands in the messages list (and DB) and
+        # the model sees it on every retry.  Original user text is
+        # preserved as the prefix; resolved blocks are appended.
+        user_message = self._expand_user_references(user_message)
 
         # Ensure system message is first.
         if not messages or messages[0].get("role") != "system":

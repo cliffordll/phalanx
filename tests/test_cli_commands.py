@@ -108,7 +108,9 @@ def test_commands_dict_marks_stub_entries():
 
 
 def test_commands_by_category_partitioning():
-    expected = {"Session", "Configuration", "Tools", "Info", "Exit"}
+    expected = {
+        "Session", "Configuration", "Tools", "Context", "Info", "Exit",
+    }
     assert set(COMMANDS_BY_CATEGORY) == expected
 
 

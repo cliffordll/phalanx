@@ -741,6 +741,58 @@ async def reveal_env_var(body: _EnvVarReveal):
     return {"key": body.key, "value": value}
 
 
+# ── /api/references/resolve  (§2.8.b wave 3) ─────────────────────────
+
+
+class _RefResolveBody(BaseModel):
+    text: str
+
+
+@app.post("/api/references/resolve")
+async def resolve_references_endpoint(body: _RefResolveBody):
+    """Resolve ``@file:`` / ``@diff`` / ``@url:`` / ``@session:``
+    references in *text* and return the rewritten text plus a
+    per-reference outcome list.
+
+    Drives the future ChatPage's ``resolveReference`` client-side hook
+    and lets external tools preview what an inline reference would
+    expand to.  Reuses the same :class:`ReferenceResolver` the agent
+    runs in ``run_conversation`` so what-you-see is what-the-model-sees.
+    """
+    from agent.context_references import ReferenceResolver
+    from hermes_state import SessionDB
+
+    db: Optional[SessionDB] = None
+    try:
+        try:
+            db = SessionDB()
+        except Exception as exc:
+            _log.debug("references/resolve: session DB unavailable: %s", exc)
+            db = None
+        resolver = ReferenceResolver(cwd=os.getcwd(), session_db=db)
+        rewritten, resolved = resolver.resolve(body.text or "")
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+    return {
+        "rewritten_text": rewritten,
+        "resolved": [
+            {
+                "type": r.type,
+                "key": r.key,
+                "content": r.content,
+                "error": r.error,
+                "content_chars": r.content_chars,
+            }
+            for r in resolved
+        ],
+    }
+
+
 # ── SPA mount ──────────────────────────────────────────────────────────
 
 

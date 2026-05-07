@@ -106,6 +106,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Tools", args_hint="[list|disable|enable] [name...]",
                subcommands=("list", "disable", "enable")),
 
+    # Context ────────────────────────────────────────────────────────────
+    CommandDef("ref",
+               "Inspect @file:/@diff/@url:/@session references resolved this turn",
+               "Context", args_hint="[show|help]",
+               subcommands=("show", "help")),
+
     # Info ───────────────────────────────────────────────────────────────
     CommandDef("help", "Show available commands", "Info"),
 

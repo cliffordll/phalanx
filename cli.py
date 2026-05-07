@@ -285,7 +285,9 @@ def _cmd_help(args: str, state: dict) -> Optional[str]:
         by_cat.setdefault(cmd.category, []).append(cmd)
 
     print("Available slash commands:\n")
-    for category in ("Session", "Configuration", "Tools", "Info", "Exit"):
+    for category in (
+        "Session", "Configuration", "Tools", "Context", "Info", "Exit",
+    ):
         cmds = by_cat.get(category)
         if not cmds:
             continue
@@ -495,6 +497,43 @@ def _cmd_resume(args: str, state: dict) -> None:
     return None
 
 
+def _cmd_ref(args: str, state: dict) -> None:
+    """Show / explain inline @-references (`@file:` `@diff` `@url:` `@session:`).
+
+    Bare ``/ref`` and ``/ref show`` print a one-line entry per reference
+    expanded on the most recent turn (type, key, content size, error).
+    ``/ref help`` prints usage syntax.  Anything else is treated as
+    ``show`` so the command is forgiving of stray words.
+    """
+    sub = (args or "").strip().lower()
+    if sub.startswith("help"):
+        print(
+            "Inline references — paste these into your prompt and phalanx\n"
+            "appends the resolved content to the message before sending:\n\n"
+            "    @file:path/to/x.py    read a file (path-secured to cwd)\n"
+            "    @diff[:<ref>]         git diff (working tree, or vs <ref>)\n"
+            "    @url:https://...      HTTP GET (text only, size-capped)\n"
+            "    @session:<id|prefix>  recent turns from a previous session\n\n"
+            "Use /ref show after a turn to see exactly what was expanded."
+        )
+        return None
+
+    agent = state.get("agent")
+    refs = getattr(agent, "_last_resolved_refs", None) or []
+    if not refs:
+        print("(no references resolved this turn)")
+        return None
+    print(f"Resolved {len(refs)} reference(s) on the last turn:\n")
+    for r in refs:
+        key_part = f":{r.key}" if getattr(r, "key", "") else ""
+        if getattr(r, "error", None):
+            print(f"  @{r.type}{key_part}  ✗ error: {r.error}")
+        else:
+            chars = getattr(r, "content_chars", 0)
+            print(f"  @{r.type}{key_part}  ✓ {chars:,} chars")
+    return None
+
+
 # Dispatch table — wave 3 wires the day-to-day handlers.  Anything not
 # listed here that's still in the registry falls through to
 # ``_cmd_stub`` which prints 'not yet implemented'.
@@ -506,6 +545,7 @@ _SLASH_HANDLERS: dict[str, Any] = {
     "model":   _cmd_model,
     "debug":   _cmd_debug,
     "tools":   _cmd_tools,
+    "ref":     _cmd_ref,
     "resume":  _cmd_resume,
     "quit":    _cmd_exit,
     "exit":    _cmd_exit,
