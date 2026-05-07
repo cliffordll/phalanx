@@ -9,7 +9,7 @@
 
 本文记录 **§2.8.a 四个 wave 把"任何改动都有数字"装到 phalanx 上的过程**——`tests/golden/` YAML schema + `hermes_cli/eval.py` 三件套（loader / runner / verifier）+ `hermes eval` 子命令 + 持久化 / diff / CI smoke。落地后 phalanx 第一次具备**单次跑全套 golden task → 落基线 → 改完代码 → diff 看回归**的完整闭环。
 
-§2.8.a 是 §2.8 系列里**唯一无前置依赖**的子期，故放第一——后续每条（§2.8.b memory、§2.8.c delegate、§2.8.d skills…）改完都能 `hermes eval --baseline X --diff` 验证有没有变差，避免"感觉良好的猜测"。
+§2.8.a 是 §2.8 系列里**唯一无前置依赖**的子期，故放第一——后续每条（§2.8.b memory、§2.8.c delegate、§2.8.e skills…）改完都能 `hermes eval --baseline X --diff` 验证有没有变差，避免"感觉良好的猜测"。
 
 ## 0. 范围与 wave 划分
 

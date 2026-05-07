@@ -403,9 +403,9 @@ web_tools 是当前 phalanx **唯一**的 auxiliary 消费者。wave 3 落 async
 
 ### 6.8 为什么 curator 不在 §2.8.c？
 
-`agent/curator.py` 上游是"周期性扫所有 skills 淘汰冗余"的 background worker。phalanx 现在还没 skills 系统（§2.8.d 才做）。curator 没 skill 可 curate。
+`agent/curator.py` 上游是"周期性扫所有 skills 淘汰冗余"的 background worker。phalanx 现在还没 skills 系统（§2.8.e 才做）。curator 没 skill 可 curate。
 
-放到 §2.8.d skills 期一起做更合理——skills 系统的设计会决定 curator 接什么数据。
+放到 §2.8.e skills 期一起做更合理——skills 系统的设计会决定 curator 接什么数据。
 
 ## 7. 已知风险 & 后续 wave 候选
 
@@ -488,8 +488,8 @@ phalanx eval --baseline <run_id> --diff
 |---|---|---|
 | `tools/delegate_tool.py` | 同名（精简版） | 上游有 sandbox / approval flow / artifact passing 高级形态；phalanx 先做基础 spawn + role + budget 共享 |
 | `agent/auxiliary_client.py`（~3914 行） | 同名（继续扩） | §2.8.b wave 2 已落同步；§2.8.c wave 3 落异步；credential pool / Nous 路由 / OAuth 可能始终留 stub |
-| `agent/curator.py` | 待 §2.8.d / §2.8.e 移植 | 跟 skills 系统耦合，§2.8.c 不动 |
-| `tools/skill_*` `tools/skills_hub.py` | §2.8.d | curator / skill discovery 一并做 |
+| `agent/curator.py` | 待 §2.8.e / §2.8.d 移植 | 跟 skills 系统耦合，§2.8.c 不动 |
+| `tools/skill_*` `tools/skills_hub.py` | §2.8.e | curator / skill discovery 一并做 |
 
 phalanx **不**直接搬上游 delegate 实现因为：
 
@@ -554,4 +554,4 @@ phalanx eval --baseline <run_id> --diff
 
 ---
 
-**§2.8.c 落地后 phalanx 闭环图里的"反思"段第一次有了真实组件**——经验流（§2.8.b memory）→ 反思（§2.8.c critic）→ 评估（§2.8.a eval）三段半全部接通，再补一个"更新"机制（skill 创建 / prompt 改写 / RL）就闭环。这是为什么 §2.8.c 的优先级排在 §2.8.d skills 之前。
+**§2.8.c 落地后 phalanx 闭环图里的"反思"段第一次有了真实组件**——经验流（§2.8.b memory）→ 反思（§2.8.c critic）→ 评估（§2.8.a eval）三段半全部接通，再补一个"更新"机制（skill 创建 / prompt 改写 / RL）就闭环。这是为什么 §2.8.c 的优先级排在 §2.8.e skills 之前。
