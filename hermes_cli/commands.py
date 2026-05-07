@@ -111,6 +111,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Inspect @file:/@diff/@url:/@session references resolved this turn",
                "Context", args_hint="[show|help]",
                subcommands=("show", "help")),
+    CommandDef("critic",
+               "Spawn a critic sub-agent to review the last assistant reply",
+               "Context", args_hint="[help]",
+               subcommands=("help",)),
 
     # Info ───────────────────────────────────────────────────────────────
     CommandDef("help", "Show available commands", "Info"),

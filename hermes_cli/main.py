@@ -109,6 +109,10 @@ def _build_parser() -> argparse.ArgumentParser:
                        help="after replying, print the full messages array as JSON to stderr")
     p_one.add_argument("--dump-tools", action="store_true",
                        help="after replying, print the tools schema array as JSON to stderr")
+    p_one.add_argument("--critic-model", default=None,
+                       help=("after the main agent finishes, spawn a critic "
+                             "sub-agent on this model and print its review "
+                             "(VERDICT: ACCEPT/REJECT/REVISE)"))
     p_stream = p_one.add_mutually_exclusive_group()
     p_stream.add_argument("--stream", dest="stream", action="store_true", default=None,
                           help="enable streaming (text deltas printed live to stdout)")
@@ -531,6 +535,67 @@ def _build_agent(args: argparse.Namespace, *,
 # ── Subcommand handlers ────────────────────────────────────────────────
 
 
+def _run_oneshot_critic(
+    main_agent: Any,
+    *,
+    main_response: str,
+    user_msg: str,
+    critic_model: str,
+) -> None:
+    """Run a critic sub-agent on the main agent's reply and print review.
+
+    Reuses the delegate_task tool dispatch path so the same
+    IterationBudget / parent_session_id / depth machinery applies as a
+    main-agent-initiated critic call would.  Failures are swallowed —
+    the critic is advisory; if it crashes the user still has the main
+    agent's answer.
+    """
+    if not main_response.strip():
+        sys.stderr.write(
+            "[critic] main response was empty — skipping critic\n"
+        )
+        return
+    try:
+        from tools.delegate_tool import delegate_task, extract_verdict
+    except Exception as exc:
+        sys.stderr.write(f"[critic] could not import delegate tool: {exc}\n")
+        return
+
+    raw = delegate_task(
+        {
+            "task_description": (
+                f"Review the following reply produced by the main "
+                f"agent for the user request: {user_msg!r}"
+            ),
+            "role": "critic",
+            "subject_artifact": main_response,
+            "model_override": critic_model,
+        },
+        caller_agent=main_agent,
+    )
+    try:
+        critic_result = json.loads(raw)
+    except Exception:
+        sys.stderr.write(f"[critic] could not parse delegate result: {raw}\n")
+        return
+
+    if "error" in critic_result:
+        sys.stderr.write(f"[critic] {critic_result['error']}\n")
+        return
+
+    review_text = (critic_result.get("final_response") or "").strip()
+    verdict = extract_verdict(review_text) or "?"
+    print()
+    print("──────── critic ({}) ────────".format(critic_model))
+    print(review_text or "(critic produced no output)")
+    if verdict == "?":
+        print(
+            "[critic] no VERDICT line found in critic response — "
+            "treat as advisory only."
+        )
+    print("─" * 32)
+
+
 def cmd_oneshot(args: argparse.Namespace) -> int:
     msg = args.message or args.message_kw
     if not msg:
@@ -565,6 +630,21 @@ def cmd_oneshot(args: argparse.Namespace) -> int:
         sys.stdout.write("\n")
     else:
         print(result.get("final_response", ""))
+
+    # §2.8.c wave 2 — auto-critic.  When --critic-model is set, the
+    # main agent's reply is re-examined by a critic sub-agent.  The
+    # critic doesn't change the main agent's exit code or stdout
+    # primary line — its review goes to a clearly-delimited block
+    # below the answer.
+    critic_model = getattr(args, "critic_model", None)
+    if critic_model:
+        _run_oneshot_critic(
+            agent,
+            main_response=result.get("final_response", ""),
+            user_msg=msg,
+            critic_model=critic_model,
+        )
+
     if _Flags.debug:
         sys.stderr.write(
             f"\n[done] turns={result['api_calls']} stop={result['stop_reason']} "

@@ -38,7 +38,7 @@ refuses to spawn anything when it can't see the parent.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from tools.registry import registry, tool_error, tool_result
 
@@ -49,15 +49,53 @@ logger = logging.getLogger(__name__)
 
 _DELEGATION_DEPTH_MAX = 2
 
-# Recognised role values.  Wave 1 only consumes "executor" semantics
-# (no system-prompt customisation); the closed set lets the schema
-# advertise the wave-2 surface without behavior drift.
+# Recognised role values.  Wave 2 consumes critic + planner with
+# specialised system prompts; executor falls through to the default.
 _ROLES = ("executor", "critic", "planner")
 
 # Sub-agent default for max_iterations when caller doesn't override.
 # Bounded by parent.iteration_budget.remaining at runtime regardless,
 # so this is a soft hint not a hard cap.
 _DEFAULT_SUB_MAX_ITERATIONS = 20
+
+# Role-specific system prompts (§2.8.c wave 2).  Empty value for
+# "executor" means: skip ephemeral injection entirely so the
+# sub-agent gets the full default system prompt unchanged.
+#
+# critic / planner outputs are *forced* into a parser-friendly shape so
+# downstream tooling (CLI --critic-model, /critic REPL, future agents
+# that grep VERDICT from sub.final_response) can act on the result
+# without re-prompting.  No structured output → caller would have to
+# regex-decode natural-language; in practice that's where the value
+# leaks.
+_ROLE_SYSTEM_PROMPTS = {
+    "executor": "",
+    "critic": (
+        "You are a senior code reviewer.  You will be given a task "
+        "context and an artifact (the work to review).  Output a "
+        "numbered list of issues found, ranked by severity "
+        "(1=blocker through 5=nitpick).  Each issue must cite a "
+        "specific file path and line number when applicable, and "
+        "propose a concrete fix — not just 'this is wrong'.  After "
+        "the issue list, output exactly one line in this format:\n\n"
+        "    VERDICT: ACCEPT|REJECT|REVISE\n\n"
+        "Pick exactly one of ACCEPT (looks good), REJECT (start "
+        "over), or REVISE (fix the listed issues and resubmit).  "
+        "The single VERDICT line must be present even if your issue "
+        "list is empty (in which case ACCEPT)."
+    ),
+    "planner": (
+        "You decompose tasks into a numbered execution plan.  Each "
+        "step must be at most one sentence and produce a checkable "
+        "artifact — a file changed, a test passed, a command "
+        "executed with observable output.  Do not actually execute "
+        "anything; only plan.  After the numbered list, output "
+        "exactly one line in this format:\n\n"
+        "    ESTIMATE: N turn(s)\n\n"
+        "Where N is your honest estimate of the total turns the "
+        "executor agent will need to complete the plan."
+    ),
+}
 
 
 # ─── Schema (advertised to the model) ──────────────────────────────────
@@ -124,9 +162,21 @@ DELEGATE_SCHEMA = {
                 "description": (
                     "Optional content for the sub-agent to operate "
                     "on (a patch to review, a doc to summarise, "
-                    "etc.).  Wave 1 records but does not yet "
-                    "specially format this; wave 2 wires it into "
-                    "the critic system prompt."
+                    "etc.).  For role='critic' it lands in the "
+                    "system prompt as the artifact under review.  "
+                    "For role='executor' it appends to the user "
+                    "message in <artifact> tags.  role='planner' "
+                    "ignores it."
+                ),
+            },
+            "model_override": {
+                "type": "string",
+                "description": (
+                    "Optional sub-agent model override.  When unset, "
+                    "the sub-agent uses the same model as the "
+                    "parent.  Useful for role='critic' to use a "
+                    "cheaper model than the executor (e.g. main "
+                    "agent on gpt-4o, critic on gpt-4o-mini)."
                 ),
             },
         },
@@ -146,27 +196,44 @@ def _build_subagent(parent: Any, **overrides: Any) -> Any:
     """Construct a sub-AIAgent that inherits parent budget + session.
 
     ``overrides`` lets the caller patch specific kwargs (e.g.
-    ``max_iterations`` for the ``max_iterations_subagent`` parameter).
-    Anything not overridden inherits from *parent*.
+    ``max_iterations`` for the ``max_iterations_subagent`` parameter,
+    ``ephemeral_system_prompt`` for role-specific prompts, ``model``
+    for ``--critic-model`` style backend swaps).  Anything not
+    overridden inherits from *parent*.
     """
     from run_agent import AIAgent
 
+    # Override semantics: only treat a key as overridden when its
+    # value is truthy.  Falsy values (None / "") fall back to the
+    # parent's setting.  This matters mostly for ``model`` and
+    # ``base_url`` — the CLI passes ``model_override=None`` when no
+    # --critic-model was set, and "use parent's model" is the right
+    # behavior in that case.  ``session_db`` is the deliberate
+    # exception: the share_memory=False path wants ``None`` to mean
+    # "no DB", not "fall back".
+    def _pick(key: str, fallback: Any) -> Any:
+        if key in overrides and overrides[key]:
+            return overrides[key]
+        return fallback
+
     kwargs: Dict[str, Any] = dict(
-        model=parent.model,
-        base_url=parent._base_url,
-        api_key=parent._api_key,
-        provider=parent.provider,
+        model=_pick("model", parent.model),
+        base_url=_pick("base_url", parent._base_url),
+        api_key=_pick("api_key", parent._api_key),
+        provider=_pick("provider", parent.provider),
         max_iterations=overrides.get(
             "max_iterations", _DEFAULT_SUB_MAX_ITERATIONS
         ),
         # Shared budget — same Python object reference, sub.consume()
         # decrements parent's counter.
         iteration_budget=parent.iteration_budget,
+        # session_db: explicit None means "no DB" (share_memory=False).
         session_db=overrides.get("session_db", parent._session_db),
         parent_session_id=parent.session_id,
         platform="delegate",
         verbose_logging=parent.verbose_logging,
         quiet_mode=True,  # don't echo sub-agent banner to user terminal
+        ephemeral_system_prompt=overrides.get("ephemeral_system_prompt"),
     )
     sub = AIAgent(**kwargs)
     sub.delegation_depth = parent.delegation_depth + 1
@@ -233,6 +300,45 @@ def delegate_task(args: Dict[str, Any], **kwargs: Any) -> str:
     share_memory = bool(args.get("share_memory", True))
     subject_artifact = args.get("subject_artifact")
 
+    # Allow callers (e.g. --critic-model CLI flag) to override the
+    # sub-agent's model.  Passed via ``model_override`` kwarg on the
+    # tool dispatch path; absent → sub inherits parent's model.
+    model_override = kwargs.get("model_override") or args.get("model_override")
+
+    # Build the sub-agent's ephemeral system prompt from the role
+    # template plus (for critic) the artifact under review.  The
+    # artifact placement differs by role:
+    #
+    # * critic — artifact lives in the system prompt so the model
+    #   sees "you are reviewing X" as the framing; the user message
+    #   is just "review the artifact" pointing back at it.
+    # * planner — no artifact handling at this wave (planner takes a
+    #   task_description, produces a plan; future versions could
+    #   feed in code-to-plan-against via artifact).
+    # * executor — artifact is appended to the user message in
+    #   <artifact> tags, same as wave 1 behavior.
+    role_prompt = _ROLE_SYSTEM_PROMPTS.get(role, "")
+    ephemeral_prompt = role_prompt or None
+    user_message = task_description
+
+    if role == "critic" and subject_artifact:
+        ephemeral_prompt = (
+            (role_prompt or "")
+            + "\n\nThe artifact under review:\n\n"
+            f"<artifact>\n{subject_artifact}\n</artifact>"
+        )
+    elif role == "executor" and subject_artifact:
+        user_message = (
+            f"{task_description}\n\n"
+            f"<artifact>\n{subject_artifact}\n</artifact>"
+        )
+    # planner with subject_artifact: ignored for wave 2 — log it.
+    elif role == "planner" and subject_artifact:
+        logger.debug(
+            "delegate_task: planner role ignores subject_artifact "
+            "(reserved for future wave)"
+        )
+
     # Construct sub-agent.  Failures here (bad parent state, missing
     # AIAgent class, etc.) wrap as tool_error rather than propagate.
     try:
@@ -240,23 +346,14 @@ def delegate_task(args: Dict[str, Any], **kwargs: Any) -> str:
             caller_agent,
             max_iterations=sub_max_iterations,
             session_db=(caller_agent._session_db if share_memory else None),
+            ephemeral_system_prompt=ephemeral_prompt,
+            model=model_override,
         )
     except Exception as exc:
         logger.exception("delegate_task: sub-agent construction failed")
         return tool_error(
             f"delegate_task: sub-agent construction failed: "
             f"{type(exc).__name__}: {exc}"
-        )
-
-    # Wave 2 will format ``role`` + ``subject_artifact`` into the
-    # sub-agent's system prompt.  Wave 1 just appends artifact (when
-    # present) to the user message verbatim so the surface is wired
-    # end-to-end and tests can assert it shows up.
-    user_message = task_description
-    if subject_artifact:
-        user_message = (
-            f"{task_description}\n\n"
-            f"<artifact>\n{subject_artifact}\n</artifact>"
         )
 
     # Run sub-agent, wrap every failure mode as a structured tool
@@ -327,6 +424,35 @@ def _tool_calls_summary(messages: list) -> list:
 def _check_delegate_requirements() -> bool:
     """Delegate is always available — no external deps."""
     return True
+
+
+# ─── VERDICT extraction helper ─────────────────────────────────────────
+
+def extract_verdict(critic_response: str) -> Optional[str]:
+    """Pull ``ACCEPT`` / ``REJECT`` / ``REVISE`` from a critic response.
+
+    Looks for a line matching ``VERDICT: <word>`` (case-insensitive)
+    and returns the upper-cased verdict.  Returns ``None`` when no
+    verdict line is found — caller should treat this as a critic
+    contract violation, not a default-ACCEPT.
+
+    Used by:
+      * `phalanx oneshot --critic-model X` to colour the verdict block
+      * REPL `/critic` to short-circuit the prompt with "rejected, fix
+        these and rerun"
+      * Future eval golden tasks (verdict appears in final_response)
+    """
+    if not critic_response:
+        return None
+    import re
+    match = re.search(
+        r"^\s*VERDICT:\s*(ACCEPT|REJECT|REVISE)\s*$",
+        critic_response,
+        re.MULTILINE | re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return match.group(1).upper()
 
 
 # ─── Registration ──────────────────────────────────────────────────────

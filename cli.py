@@ -534,6 +534,89 @@ def _cmd_ref(args: str, state: dict) -> None:
     return None
 
 
+def _cmd_critic(args: str, state: dict) -> None:
+    """Spawn a critic sub-agent on the last assistant reply.
+
+    ``/critic`` (default) reviews the most recent assistant message in
+    the in-process history.  ``/critic help`` prints usage.  Uses the
+    REPL agent's own model — for a different critic model, use
+    ``phalanx oneshot --critic-model <name> "..."`` from the shell.
+    """
+    sub = (args or "").strip().lower()
+    if sub.startswith("help"):
+        print(
+            "Critic — review the last assistant reply via a sub-agent.\n\n"
+            "  /critic           Review the most recent assistant turn\n"
+            "  /critic help      Show this message\n\n"
+            "Uses the REPL's main model.  For a different critic model\n"
+            "(e.g. cheaper review pass), use\n"
+            "    phalanx oneshot --critic-model <name> \"...\"\n"
+            "from the shell instead."
+        )
+        return None
+
+    agent = state.get("agent")
+    history = state.get("history") or []
+
+    last_assistant = next(
+        (m for m in reversed(history) if m.get("role") == "assistant"
+         and isinstance(m.get("content"), str) and m["content"].strip()),
+        None,
+    )
+    if last_assistant is None:
+        print("(no assistant reply in this session yet — nothing to review)")
+        return None
+
+    last_user = next(
+        (m for m in reversed(history) if m.get("role") == "user"
+         and isinstance(m.get("content"), str)),
+        None,
+    )
+    user_prompt = (last_user or {}).get("content", "") or ""
+
+    try:
+        from tools.delegate_tool import delegate_task, extract_verdict
+    except Exception as exc:
+        print(f"(critic unavailable: {exc})")
+        return None
+
+    raw = delegate_task(
+        {
+            "task_description": (
+                f"Review the following reply produced for the user request: "
+                f"{user_prompt!r}"
+            ),
+            "role": "critic",
+            "subject_artifact": last_assistant["content"],
+        },
+        caller_agent=agent,
+    )
+
+    import json as _json
+    try:
+        result = _json.loads(raw)
+    except Exception:
+        print(f"(critic returned malformed result: {raw[:200]})")
+        return None
+
+    if "error" in result:
+        print(f"(critic failed: {result['error']})")
+        return None
+
+    review = (result.get("final_response") or "").strip()
+    verdict = extract_verdict(review) or "?"
+    print()
+    print("──────── critic ────────")
+    print(review or "(critic produced no output)")
+    if verdict == "?":
+        print(
+            "[critic] no VERDICT line found in response — treat as "
+            "advisory only."
+        )
+    print("─" * 24)
+    return None
+
+
 # Dispatch table — wave 3 wires the day-to-day handlers.  Anything not
 # listed here that's still in the registry falls through to
 # ``_cmd_stub`` which prints 'not yet implemented'.
@@ -546,6 +629,7 @@ _SLASH_HANDLERS: dict[str, Any] = {
     "debug":   _cmd_debug,
     "tools":   _cmd_tools,
     "ref":     _cmd_ref,
+    "critic":  _cmd_critic,
     "resume":  _cmd_resume,
     "quit":    _cmd_exit,
     "exit":    _cmd_exit,
