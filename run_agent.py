@@ -666,6 +666,19 @@ class AIAgent:
         # injection without removing the binding.
         self._memory_manager: Optional[Any] = None
 
+        # Context compression (§2.8.b wave 2).  Lazily constructed on
+        # first preflight so model_metadata.get_model_context_length is
+        # only invoked when actually needed (cheap cache hit, but a
+        # full network probe on cold cache).  ``agent.compression.*``
+        # config knobs gate the trigger; failure to construct or
+        # summarise never blocks the loop — the messages list is
+        # returned unchanged on any error.  ``_compressor_skipped``
+        # latches "tried once and won't try again" so a disabled or
+        # failed bind doesn't re-probe the metadata cache on every
+        # preflight.
+        self._compressor: Optional[Any] = None
+        self._compressor_skipped: bool = False
+
         # Per-conversation usage accumulator (§2.8.a wave 3).  Populated
         # by ``_accumulate_usage`` after every successful API round-trip
         # and reset at the start of ``run_conversation``.  Lets the eval
@@ -1071,6 +1084,20 @@ class AIAgent:
         self.usage_totals["cache_write_tokens"] += canon.cache_write_tokens
         self.usage_totals["reasoning_tokens"] += canon.reasoning_tokens
 
+        # Forward the *normalised* usage to the compressor so its
+        # last_prompt_tokens reflects the live API number, not just our
+        # rough estimate.  Lets the next preflight catch a model whose
+        # actual encoding inflates the request well past our estimate.
+        if self._compressor is not None:
+            try:
+                self._compressor.update_from_response({
+                    "prompt_tokens": canon.input_tokens,
+                    "completion_tokens": canon.output_tokens,
+                    "total_tokens": canon.input_tokens + canon.output_tokens,
+                })
+            except Exception:
+                pass
+
     # ── API call dispatch + retry ───────────────────────────────────
 
     def _make_api_call(
@@ -1391,6 +1418,161 @@ class AIAgent:
             logger.debug("memory injection skipped: %s", exc)
             return system_prompt
 
+    # ── context compression (§2.8.b wave 2) ─────────────────────────
+
+    def _get_compressor(self) -> Optional[Any]:
+        """Build (or return cached) :class:`ContextCompressor`.
+
+        Returns None when compression is disabled in config or when
+        :mod:`agent.context_compressor` fails to import.  Resolved
+        ``context_length`` comes from ``agent.model_metadata`` —
+        cached on disk after the first probe so repeat calls are
+        instant.
+        """
+        if self._compressor is not None:
+            return self._compressor
+        if self._compressor_skipped:
+            return None
+        try:
+            from hermes_cli.config import cfg_get, load_config
+            cfg = load_config()
+            enabled = bool(
+                cfg_get(cfg, "agent", "compression", "enabled", default=True)
+            )
+            if not enabled:
+                self._compressor_skipped = True
+                return None
+            threshold_pct = float(
+                cfg_get(cfg, "agent", "compression", "threshold_pct",
+                        default=0.7) or 0.7
+            )
+            protect_first = int(
+                cfg_get(cfg, "agent", "compression", "protect_first_n",
+                        default=3) or 3
+            )
+            protect_last = int(
+                cfg_get(cfg, "agent", "compression", "protect_last_n",
+                        default=6) or 6
+            )
+        except Exception:
+            enabled, threshold_pct = True, 0.7
+            protect_first, protect_last = 3, 6
+
+        # Resolve context_length once — model_metadata caches the result
+        # on disk so this is cheap on repeat calls.
+        context_length = 0
+        try:
+            from agent.model_metadata import get_model_context_length
+            context_length = int(
+                get_model_context_length(
+                    self.model,
+                    base_url=self._base_url,
+                    api_key=self._api_key,
+                    provider=self.provider or "",
+                )
+                or 0
+            )
+        except Exception as exc:
+            logger.debug("context_length resolve failed: %s", exc)
+
+        # Bind the auxiliary client lazily so the OpenAI() construction
+        # cost is only paid when we actually compress.  main_runtime
+        # hints let summarisation transparently reuse the agent's own
+        # endpoint when no separate auxiliary backend is configured.
+        def _client_factory():
+            try:
+                from agent.auxiliary_client import get_text_auxiliary_client
+                return get_text_auxiliary_client(
+                    "summary",
+                    main_runtime={
+                        "model": self.model,
+                        "base_url": self._base_url,
+                        "api_key": self._api_key,
+                    },
+                )
+            except Exception as exc:
+                logger.debug("auxiliary client_factory failed: %s", exc)
+                return None, None
+
+        try:
+            from agent.context_compressor import ContextCompressor
+            self._compressor = ContextCompressor(
+                model=self.model,
+                context_length=context_length,
+                threshold_percent=threshold_pct,
+                protect_first_n=protect_first,
+                protect_last_n=protect_last,
+                base_url=self._base_url,
+                api_key=self._api_key,
+                provider=self.provider or "",
+                client_factory=_client_factory,
+            )
+        except Exception as exc:
+            logger.debug("ContextCompressor bind failed: %s", exc)
+            self._compressor_skipped = True
+            return None
+        return self._compressor
+
+    # Sanity floor — preflight bails out cheaply for short histories.
+    # context_length probing (model_metadata) can take seconds on
+    # cold-cache endpoints, and a 4-message list is never going to
+    # need compression regardless of the result.
+    _COMPRESS_PROBE_FLOOR = 8
+
+    def _maybe_compress(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        focus_topic: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Preflight compression check — run before each API call.
+
+        Cheap-path early-out when the messages list is shorter than
+        ``_COMPRESS_PROBE_FLOOR`` — short histories cannot meaningfully
+        be compressed and the context_length probe in
+        :meth:`_get_compressor` is expensive on cold caches.
+
+        Past the floor: estimates the prompt token count via
+        :func:`estimate_request_tokens_rough`; calls
+        :meth:`ContextCompressor.compress` when the estimate crosses
+        the threshold.  Returns the (possibly rewritten) messages
+        list.  Any failure path returns *messages* unchanged so the
+        agent loop is never blocked by compression bugs.
+        """
+        if len(messages) < self._COMPRESS_PROBE_FLOOR:
+            return messages
+        compressor = self._get_compressor()
+        if compressor is None:
+            return messages
+        try:
+            from agent.model_metadata import estimate_request_tokens_rough
+            est = estimate_request_tokens_rough(
+                messages,
+                system_prompt=self._cached_system_prompt or "",
+            )
+        except Exception:
+            est = 0
+        if est > 0:
+            compressor.last_prompt_tokens = est
+        if not compressor.should_compress(est):
+            return messages
+        if not compressor.has_content_to_compress(messages):
+            return messages
+        try:
+            new_messages = compressor.compress(
+                messages, current_tokens=est, focus_topic=focus_topic,
+            )
+        except Exception as exc:
+            logger.warning("compression raised: %s", exc)
+            return messages
+        if new_messages is None or len(new_messages) >= len(messages):
+            return messages
+        self._vprint(
+            f"[compress] {len(messages)} -> {len(new_messages)} messages "
+            f"(est ~{est} tokens, threshold {compressor.threshold_tokens})"
+        )
+        return new_messages
+
     # ── main conversation loop ───────────────────────────────────────
 
     def run_conversation(
@@ -1512,6 +1694,13 @@ class AIAgent:
                 break
 
             self._vprint(f"[loop] turn {api_call_count}: calling {self.model}")
+
+            # §2.8.b wave 2 — context compression preflight.  When the
+            # next API call's estimated prompt would cross the threshold
+            # we summarise the protected-middle window before sending.
+            messages = self._maybe_compress(
+                messages, focus_topic=user_message,
+            )
 
             # API call with classify-and-retry — covers transient network /
             # provider errors without burning the whole iteration budget.

@@ -237,6 +237,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_iterations": 90,
         "max_tokens": 4096,
         "reasoning_effort": "medium",
+        "compression": {
+            "enabled": True,
+            "threshold_pct": 0.7,
+            "protect_first_n": 3,
+            "protect_last_n": 6,
+        },
     },
     "memory": {
         "enabled": True,
@@ -282,6 +288,22 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "memory.retrieve_limit": {
         "type": "number",
         "description": "Max memories prepended to the system prompt per turn",
+    },
+    "agent.compression.enabled": {
+        "type": "boolean",
+        "description": "Auto-summarise old turns when prompt nears context window",
+    },
+    "agent.compression.threshold_pct": {
+        "type": "number",
+        "description": "Trigger when prompt_tokens / context_length crosses this (0-1)",
+    },
+    "agent.compression.protect_first_n": {
+        "type": "number",
+        "description": "Earliest non-system turns kept verbatim during compression",
+    },
+    "agent.compression.protect_last_n": {
+        "type": "number",
+        "description": "Most recent turns kept verbatim during compression",
     },
 }
 
