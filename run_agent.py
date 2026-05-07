@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional
 
@@ -575,6 +576,8 @@ class AIAgent:
         session_db: Optional[Any] = None,
         platform: str = "cli",
         parent_session_id: Optional[str] = None,
+        yolo_mode: bool = False,
+        enable_self_mod: bool = False,
     ):
         """Initialize the AI Agent.
 
@@ -704,6 +707,17 @@ class AIAgent:
         # *also* shared so total cost is bounded — depth is a
         # complementary structural guard.
         self.delegation_depth: int = 0
+
+        # Guardrail flags (§2.8.d wave 1).  ``yolo_mode`` bypasses the
+        # interactive approval prompt for REQUIRE_APPROVAL tool calls
+        # — the user must opt in explicitly via --yolo (wave 4 wires
+        # the CLI flag).  ``enable_self_mod`` opens the self-mod
+        # gate; without it, writes to tools/ / skills/ / agent/ /
+        # ~/.phalanx/config.yaml are denied outright.  Both default
+        # False — phalanx's safe-by-default posture is "shell ops
+        # need consent, self-modification is off".
+        self.yolo_mode: bool = bool(yolo_mode)
+        self.enable_self_mod: bool = bool(enable_self_mod)
 
         # Per-conversation usage accumulator (§2.8.a wave 3).  Populated
         # by ``_accumulate_usage`` after every successful API round-trip
@@ -849,6 +863,16 @@ class AIAgent:
         dispatch = getattr(registry, "dispatch", None)
         if not callable(dispatch):
             return f"[error] tools.registry has no dispatch(); cannot run {tool_name!r}"
+
+        # §2.8.d wave 1 — pre-dispatch guardrail check.  Classification
+        # is pure (regex + path-prefix); failures inside it default to
+        # ALLOW so a guardrail bug never blocks legitimate work.  The
+        # approval prompt happens only when the verdict is
+        # REQUIRE_APPROVAL.
+        guardrail_error = self._guardrail_check(tool_name, arguments)
+        if guardrail_error is not None:
+            return guardrail_error
+
         try:
             # ``caller_agent`` lets tools that need to inspect the calling
             # AIAgent (currently only delegate_tool — for budget sharing
@@ -863,6 +887,79 @@ class AIAgent:
         except Exception as exc:
             logger.exception("tool %s failed", tool_name)
             return f"[error] tool {tool_name} raised {type(exc).__name__}: {exc}"
+
+    def _guardrail_check(
+        self, tool_name: str, arguments: Dict[str, Any],
+    ) -> Optional[str]:
+        """Run pre-dispatch guardrail; return tool_error string when
+        the call is refused, ``None`` when it should proceed.
+
+        Defaults to ALLOW on any unexpected exception inside the
+        guardrail layer — a buggy regex or path resolver should not
+        be able to block all tool execution.  The exception is logged
+        loudly so dev sees it.
+        """
+        try:
+            from agent.tool_guardrails import (
+                GuardrailVerdict,
+                ask_for_approval,
+                classify_tool_call,
+            )
+        except Exception as exc:
+            logger.warning("guardrail import failed (defaulting to ALLOW): %s", exc)
+            return None
+
+        try:
+            decision = classify_tool_call(
+                tool_name, arguments,
+                cwd=Path.cwd(),
+                enable_self_mod=self.enable_self_mod,
+            )
+        except Exception as exc:
+            logger.warning(
+                "guardrail classify_tool_call raised (defaulting to ALLOW): %s",
+                exc,
+            )
+            return None
+
+        if decision.verdict == GuardrailVerdict.ALLOW:
+            return None
+
+        if decision.verdict == GuardrailVerdict.DENY:
+            logger.info(
+                "guardrail DENY tool=%s class=%s reason=%s",
+                tool_name, decision.danger_class, decision.reason,
+            )
+            return (
+                f"[guardrail] DENY {tool_name}: {decision.reason}"
+            )
+
+        # REQUIRE_APPROVAL → ask the user.
+        try:
+            approved = ask_for_approval(
+                decision, yolo_mode=self.yolo_mode,
+            )
+        except Exception as exc:
+            logger.warning(
+                "guardrail ask_for_approval raised (defaulting to deny): %s",
+                exc,
+            )
+            approved = False
+
+        if approved:
+            logger.info(
+                "guardrail APPROVED tool=%s class=%s",
+                tool_name, decision.danger_class,
+            )
+            return None
+
+        logger.info(
+            "guardrail USER_DENIED tool=%s class=%s",
+            tool_name, decision.danger_class,
+        )
+        return (
+            f"[guardrail] user denied {tool_name}: {decision.reason}"
+        )
 
     def _get_active_terminal_env(self):
         """Return the active LocalTerminalEnv for this task, or None.
