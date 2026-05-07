@@ -303,39 +303,216 @@ def summarize_messages(
 
 
 # ---------------------------------------------------------------------------
-# Backwards-compat surface — async / extra-body / get_async_text_auxiliary_client
+# Async surface (§2.8.c wave 3)
 # ---------------------------------------------------------------------------
 #
-# The previous Phase-2.2 shim exposed an async surface used (only) by
-# web_tools' page-summary path.  Keep those names working — web_tools
-# still expects ``(None, None)`` to mean "no auxiliary available, fall
-# back to truncated raw content".
+# The async surface mirrors the sync surface above but uses AsyncOpenAI
+# so callers in event-loop contexts (web_tools, future async REPL,
+# delegate streaming) don't block the loop on network I/O.  Config
+# resolution helpers (_resolve_auxiliary_config /
+# _apply_main_runtime_fallback / _apply_env_fallback) are shared with
+# the sync path so behavior is identical except for sync vs await.
+
+# Default timeout for auxiliary calls.  Web-tools historically read
+# ``auxiliary.web_extract.timeout`` from config; honour the same key
+# for backwards compat, falling through to 360 s when unset.
+_DEFAULT_AUXILIARY_TIMEOUT_S = 360.0
+
+
+def _resolve_auxiliary_timeout(task: str) -> float:
+    """Read ``auxiliary.<task>.timeout`` from config, default 360 s."""
+    try:
+        from hermes_cli.config import cfg_get, load_config
+        cfg = load_config()
+        val = cfg_get(cfg, "auxiliary", task, "timeout", default=None)
+        if val is None:
+            val = cfg_get(
+                cfg, "auxiliary", "default", "timeout", default=None,
+            )
+        if val is not None:
+            return float(val)
+    except Exception:
+        pass
+    return _DEFAULT_AUXILIARY_TIMEOUT_S
+
 
 def get_async_text_auxiliary_client(
     task: str = "",
     *,
-    main_runtime: Optional[Dict[str, Any]] = None,
+    main_runtime: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
-    """Async client surface — phalanx hasn't ported the async path yet.
+    """Resolve an :class:`openai.AsyncOpenAI` client + model id.
 
-    Returns ``(None, None)`` so web_tools falls back to truncated raw
-    content.  When the async surface lands, this shim disappears.
+    Mirrors :func:`get_text_auxiliary_client` but builds the *async*
+    OpenAI client.  Sync construction (the SDK builds clients
+    synchronously even though calls are async) — the function is
+    sync; only the call paths are coroutines.
+
+    Returns ``(None, None)`` on any failure so callers (web_tools,
+    delegate critic, future ChatPage) can degrade gracefully without
+    catching exceptions just to fall back to truncated content.
     """
-    return None, None
+    try:
+        from openai import AsyncOpenAI
+    except Exception as exc:
+        logger.debug("AsyncOpenAI SDK unavailable: %s", exc)
+        return None, None
+
+    cfg = _resolve_auxiliary_config(task)
+    cfg = _apply_main_runtime_fallback(cfg, main_runtime)
+    cfg = _apply_env_fallback(cfg)
+
+    if not cfg.get("model"):
+        logger.debug("async auxiliary task=%r: no model resolved", task)
+        return None, None
+
+    kwargs: Dict[str, Any] = {}
+    if cfg["api_key"]:
+        kwargs["api_key"] = cfg["api_key"]
+    if cfg["base_url"]:
+        kwargs["base_url"] = cfg["base_url"]
+    try:
+        client = AsyncOpenAI(**kwargs)
+    except Exception as exc:
+        logger.debug("AsyncOpenAI() construction failed: %s", exc)
+        return None, None
+    return client, cfg["model"]
 
 
 def get_auxiliary_extra_body() -> Dict[str, Any]:
-    """No per-deployment routing tags in the phalanx port."""
+    """No per-deployment routing tags in the phalanx port.
+
+    Reserved for upstream's Nous gateway tagging.  Returning ``{}``
+    keeps web_tools' Nous-detection branch a no-op.
+    """
     return {}
 
 
-async def async_call_llm(**_kwargs: Any) -> Any:
-    """Async path is not yet wired.  Web-tools detects the
-    ``(None, None)`` from :func:`get_async_text_auxiliary_client` and
-    avoids ever reaching this — so raise loudly if anything else does.
+async def async_call_llm(
+    *,
+    task: str = "",
+    model: Optional[str] = None,
+    messages: Optional[List[Dict[str, Any]]] = None,
+    max_tokens: int = 4096,
+    temperature: float = 0.0,
+    extra_body: Optional[Dict[str, Any]] = None,
+    timeout: Optional[float] = None,
+    client: Optional[Any] = None,
+    main_runtime: Optional[Mapping[str, Any]] = None,
+) -> Any:
+    """Run one async chat-completion call against the auxiliary backend.
+
+    Resolution order for the client:
+
+    1. If *client* is supplied, use it directly (caller already
+       resolved).  *model* must also be supplied in that case.
+    2. Otherwise call :func:`get_async_text_auxiliary_client` to
+       resolve from config + main_runtime + env.
+
+    Raises :class:`RuntimeError` when no usable client/model is
+    available.  Web-tools' summariser catches this and returns
+    ``None`` to its caller, which then degrades to truncated raw
+    content.
+
+    The OpenAI SDK call itself is **not** wrapped in try/except —
+    callers want network errors / API errors to propagate so they
+    can decide on their own retry / fallback policy.  Only the
+    "no auxiliary configured" case becomes a RuntimeError; real API
+    failures bubble up unchanged.
     """
-    raise RuntimeError(
-        "agent.auxiliary_client.async_call_llm is not yet ported.  "
-        "Sync callers should use summarize_messages() with "
-        "get_text_auxiliary_client()."
+    if not messages:
+        raise RuntimeError("async_call_llm: messages is required")
+
+    if client is None:
+        resolved_client, resolved_model = get_async_text_auxiliary_client(
+            task, main_runtime=main_runtime,
+        )
+        if resolved_client is None or not (model or resolved_model):
+            raise RuntimeError(
+                "async_call_llm: no auxiliary client/model available "
+                f"for task={task!r}"
+            )
+        client = resolved_client
+        if not model:
+            model = resolved_model
+
+    if timeout is None:
+        timeout = _resolve_auxiliary_timeout(task or "default")
+
+    call_kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if extra_body:
+        call_kwargs["extra_body"] = extra_body
+    if timeout is not None:
+        call_kwargs["timeout"] = timeout
+
+    return await client.chat.completions.create(**call_kwargs)
+
+
+async def async_summarize_messages(
+    client: Any,
+    model: str,
+    messages: List[Dict[str, Any]],
+    *,
+    focus_topic: Optional[str] = None,
+    max_tokens: int = 1024,
+    temperature: float = 0.0,
+    timeout: Optional[float] = None,
+) -> Optional[str]:
+    """Async mirror of :func:`summarize_messages`.
+
+    Same return contract: text on success, ``None`` on empty input /
+    empty response / API exception.  Caller decides what to do with
+    None (compressor falls back to pruning, web_tools to truncated
+    raw, etc.).
+    """
+    if client is None or not model or not messages:
+        return None
+
+    transcript = _format_messages_for_summary(messages)
+    if not transcript.strip():
+        return None
+
+    user_msg = (
+        "Summarise the following conversation slice for use as a context "
+        "anchor in subsequent turns.  Preserve all load-bearing details "
+        "(decisions, file paths, errors, pending instructions); drop "
+        "obsolete tool output and pleasantries.\n\n"
     )
+    if focus_topic:
+        user_msg += (
+            f"The agent is currently working on: {focus_topic!r}.  "
+            "Prioritise details related to this task.\n\n"
+        )
+    user_msg += "--- begin conversation slice ---\n"
+    user_msg += transcript
+    user_msg += "\n--- end conversation slice ---"
+
+    call_kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if timeout is not None:
+        call_kwargs["timeout"] = timeout
+
+    try:
+        response = await client.chat.completions.create(**call_kwargs)
+    except Exception as exc:
+        logger.warning("async_summarize_messages: API call failed: %s", exc)
+        return None
+
+    text = extract_content_or_reasoning(response)
+    text = (text or "").strip()
+    if not text:
+        logger.debug("async_summarize_messages: empty response")
+        return None
+    return text
